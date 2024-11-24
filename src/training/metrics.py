@@ -2,239 +2,286 @@ import torch
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
-from seqeval.metrics import f1_score, precision_score, recall_score, classification_report
-from sklearn.metrics import silhouette_score, davies_bouldin_score, v_measure_score
+from seqeval.metrics import classification_report, f1_score, precision_score, recall_score
+from sklearn.metrics import v_measure_score, normalized_mutual_info_score, coherence_score
 import logging
+from scipy.spatial.distance import cosine
+
+logger = logging.getLogger(__name__)
 
 class FewTopNERMetrics:
-    """
-    Evaluation metrics for FewTopNER model
-    """
+    """Enhanced metrics for joint NER and Topic evaluation"""
+    
     def __init__(self, config):
         self.config = config
-        self.logger = logging.getLogger(__name__)
         
-        # Initialize metric accumulators
+        # NER label mapping from WikiNEuRal
+        self.ner_label_map = {
+            0: 'O',
+            1: 'B-PER', 2: 'I-PER',
+            3: 'B-ORG', 4: 'I-ORG',
+            5: 'B-LOC', 6: 'I-LOC',
+            7: 'B-MISC', 8: 'I-MISC'
+        }
+        
+        # Languages supported
+        self.languages = ['en', 'fr', 'de', 'es', 'it']
+        
         self.reset()
         
     def reset(self):
-        """Reset all metric accumulators"""
-        # NER metrics
-        self.ner_predictions = []
-        self.ner_targets = []
+        """Reset metric accumulators"""
+        # Per-language NER metrics
+        self.ner_scores = {
+            lang: {
+                'predictions': [],
+                'labels': [],
+                'f1_scores': [],
+                'precision_scores': [],
+                'recall_scores': []
+            }
+            for lang in self.languages
+        }
         
-        # Topic metrics
-        self.topic_predictions = []
-        self.topic_targets = []
-        self.topic_features = []
-        
-        # Few-shot metrics
-        self.episode_scores = defaultdict(list)
+        # Per-language topic metrics
+        self.topic_scores = {
+            lang: {
+                'predictions': [],
+                'labels': [],
+                'features': [],
+                'coherence_scores': [],
+                'nmi_scores': []
+            }
+            for lang in self.languages
+        }
         
         # Cross-lingual metrics
-        self.language_scores = defaultdict(lambda: defaultdict(list))
+        self.cross_lingual_scores = defaultdict(list)
         
+        # Few-shot episode metrics
+        self.episode_scores = defaultdict(list)
+
+    def convert_to_bio_tags(
+        self,
+        label_ids: torch.Tensor,
+        attention_mask: torch.Tensor
+    ) -> List[List[str]]:
+        """Convert label IDs to BIO tags"""
+        predictions = []
+        for seq_ids, mask in zip(label_ids, attention_mask):
+            valid_ids = seq_ids[mask.bool()]
+            tags = [self.ner_label_map[id.item()] for id in valid_ids if id != -100]
+            predictions.append(tags)
+        return predictions
+
     def update_ner_metrics(
         self,
-        predictions: List[List[str]],
-        targets: List[List[str]],
-        language: Optional[str] = None
+        predictions: torch.Tensor,
+        labels: torch.Tensor,
+        attention_mask: torch.Tensor,
+        language_ids: torch.Tensor
     ):
-        """
-        Update NER metric accumulators
+        """Update NER metrics for each language"""
+        # Convert tensors to BIO tags
+        pred_tags = self.convert_to_bio_tags(predictions, attention_mask)
+        true_tags = self.convert_to_bio_tags(labels, attention_mask)
         
-        Args:
-            predictions: Predicted entity labels
-            targets: True entity labels
-            language: Optional language code
-        """
-        self.ner_predictions.extend(predictions)
-        self.ner_targets.extend(targets)
-        
-        if language:
-            # Compute F1 score for this batch
-            batch_f1 = f1_score(predictions, targets)
-            self.language_scores[language]['ner_f1'].append(batch_f1)
+        # Update per-language metrics
+        for i, lang_id in enumerate(language_ids):
+            lang = self.languages[lang_id.item()]
+            lang_scores = self.ner_scores[lang]
             
+            # Store predictions and labels
+            lang_scores['predictions'].extend([pred_tags[i]])
+            lang_scores['labels'].extend([true_tags[i]])
+            
+            # Compute scores
+            try:
+                f1 = f1_score([true_tags[i]], [pred_tags[i]])
+                precision = precision_score([true_tags[i]], [pred_tags[i]])
+                recall = recall_score([true_tags[i]], [pred_tags[i]])
+                
+                lang_scores['f1_scores'].append(f1)
+                lang_scores['precision_scores'].append(precision)
+                lang_scores['recall_scores'].append(recall)
+            except:
+                continue
+
     def update_topic_metrics(
         self,
         predictions: torch.Tensor,
-        targets: torch.Tensor,
+        labels: torch.Tensor,
         features: torch.Tensor,
-        language: Optional[str] = None
+        language_ids: torch.Tensor,
+        texts: List[str]
     ):
-        """
-        Update topic modeling metric accumulators
-        
-        Args:
-            predictions: Predicted topic labels
-            targets: True topic labels
-            features: Topic features for clustering metrics
-            language: Optional language code
-        """
-        self.topic_predictions.extend(predictions.cpu().numpy())
-        self.topic_targets.extend(targets.cpu().numpy())
-        self.topic_features.append(features.cpu().numpy())
-        
-        if language:
-            # Compute V-measure score for this batch
-            batch_v_score = v_measure_score(targets.cpu(), predictions.cpu())
-            self.language_scores[language]['topic_v_score'].append(batch_v_score)
+        """Update topic modeling metrics for each language"""
+        for i, lang_id in enumerate(language_ids):
+            lang = self.languages[lang_id.item()]
+            lang_scores = self.topic_scores[lang]
             
+            # Store predictions, labels, and features
+            lang_scores['predictions'].append(predictions[i].cpu())
+            lang_scores['labels'].append(labels[i].cpu())
+            lang_scores['features'].append(features[i].cpu())
+            
+            # Compute NMI score
+            nmi = normalized_mutual_info_score(
+                labels[i].cpu().numpy(),
+                predictions[i].cpu().numpy()
+            )
+            lang_scores['nmi_scores'].append(nmi)
+            
+            # Compute topic coherence if texts are provided
+            if texts:
+                coherence = self.compute_topic_coherence(
+                    texts[i],
+                    predictions[i].cpu().numpy(),
+                    features[i].cpu().numpy()
+                )
+                lang_scores['coherence_scores'].append(coherence)
+
+    def compute_topic_coherence(
+        self,
+        text: str,
+        prediction: int,
+        features: np.ndarray
+    ) -> float:
+        """Compute topic coherence score"""
+        # This is a simplified coherence calculation
+        # In practice, you might want to use more sophisticated methods
+        words = text.lower().split()
+        word_pairs = [(words[i], words[i+1]) 
+                     for i in range(len(words)-1)]
+        
+        coherence = 0
+        if word_pairs:
+            coherence = np.mean([
+                1 - cosine(features, features)
+                for w1, w2 in word_pairs
+            ])
+        return coherence
+
     def update_episode_metrics(
         self,
-        support_accuracy: float,
-        query_accuracy: float,
-        adaptation_steps: int
+        support_ner_f1: float,
+        support_topic_acc: float,
+        query_ner_f1: float,
+        query_topic_acc: float,
+        languages: List[str]
     ):
-        """
-        Update few-shot learning metric accumulators
+        """Update few-shot episode metrics"""
+        self.episode_scores['support_ner_f1'].append(support_ner_f1)
+        self.episode_scores['support_topic_acc'].append(support_topic_acc)
+        self.episode_scores['query_ner_f1'].append(query_ner_f1)
+        self.episode_scores['query_topic_acc'].append(query_topic_acc)
         
-        Args:
-            support_accuracy: Accuracy on support set
-            query_accuracy: Accuracy on query set
-            adaptation_steps: Number of adaptation steps
-        """
-        self.episode_scores['support_accuracy'].append(support_accuracy)
-        self.episode_scores['query_accuracy'].append(query_accuracy)
-        self.episode_scores['adaptation_steps'].append(adaptation_steps)
-        
-    def compute_ner_metrics(self) -> Dict[str, float]:
-        """
-        Compute final NER metrics
-        
-        Returns:
-            Dictionary of metrics
-        """
+        # Track cross-lingual performance
+        lang_pair = '_'.join(sorted(languages))
+        self.cross_lingual_scores[lang_pair].append({
+            'ner_f1': query_ner_f1,
+            'topic_acc': query_topic_acc
+        })
+
+    def compute_metrics(self) -> Dict[str, Dict[str, float]]:
+        """Compute all metrics"""
         metrics = {
-            'precision': precision_score(self.ner_targets, self.ner_predictions),
-            'recall': recall_score(self.ner_targets, self.ner_predictions),
-            'f1': f1_score(self.ner_targets, self.ner_predictions)
+            'per_language': {},
+            'average': {},
+            'cross_lingual': {},
+            'few_shot': {}
         }
         
-        # Detailed classification report
-        report = classification_report(
-            self.ner_targets,
-            self.ner_predictions,
-            output_dict=True
+        # Compute per-language metrics
+        for lang in self.languages:
+            ner_metrics = self._compute_language_ner_metrics(lang)
+            topic_metrics = self._compute_language_topic_metrics(lang)
+            
+            metrics['per_language'][lang] = {
+                'ner': ner_metrics,
+                'topic': topic_metrics
+            }
+        
+        # Compute average metrics
+        metrics['average'] = self._compute_average_metrics(
+            metrics['per_language']
         )
         
-        # Add per-entity type metrics
-        for entity_type, scores in report.items():
-            if isinstance(scores, dict):
-                metrics[f'{entity_type}_f1'] = scores['f1-score']
-                
+        # Compute cross-lingual metrics
+        metrics['cross_lingual'] = self._compute_cross_lingual_metrics()
+        
+        # Compute few-shot metrics
+        metrics['few_shot'] = self._compute_few_shot_metrics()
+        
         return metrics
-        
-    def compute_topic_metrics(self) -> Dict[str, float]:
-        """
-        Compute final topic modeling metrics
-        
-        Returns:
-            Dictionary of metrics
-        """
-        # Convert lists to arrays
-        predictions = np.array(self.topic_predictions)
-        targets = np.array(self.topic_targets)
-        features = np.concatenate(self.topic_features, axis=0)
+
+    def _compute_language_ner_metrics(self, lang: str) -> Dict[str, float]:
+        """Compute NER metrics for a specific language"""
+        scores = self.ner_scores[lang]
         
         metrics = {
-            'v_measure': v_measure_score(targets, predictions),
-            'silhouette': silhouette_score(features, predictions),
-            'davies_bouldin': davies_bouldin_score(features, predictions)
+            'f1': np.mean(scores['f1_scores']) if scores['f1_scores'] else 0.0,
+            'precision': np.mean(scores['precision_scores']) if scores['precision_scores'] else 0.0,
+            'recall': np.mean(scores['recall_scores']) if scores['recall_scores'] else 0.0
         }
         
-        # Compute topic coherence if available
-        if hasattr(self, 'compute_topic_coherence'):
-            metrics['coherence'] = self.compute_topic_coherence(features, predictions)
+        # Add detailed classification report
+        if scores['predictions'] and scores['labels']:
+            report = classification_report(
+                scores['labels'],
+                scores['predictions'],
+                output_dict=True
+            )
             
+            for entity_type, values in report.items():
+                if isinstance(values, dict):
+                    metrics[f'{entity_type}_f1'] = values['f1-score']
+        
         return metrics
+
+    def _compute_language_topic_metrics(self, lang: str) -> Dict[str, float]:
+        """Compute topic metrics for a specific language"""
+        scores = self.topic_scores[lang]
         
-    def compute_few_shot_metrics(self) -> Dict[str, float]:
-        """
-        Compute few-shot learning metrics
+        metrics = {
+            'nmi': np.mean(scores['nmi_scores']) if scores['nmi_scores'] else 0.0,
+            'coherence': np.mean(scores['coherence_scores']) if scores['coherence_scores'] else 0.0
+        }
         
-        Returns:
-            Dictionary of metrics
-        """
+        return metrics
+
+    def _compute_average_metrics(
+        self,
+        language_metrics: Dict[str, Dict[str, Dict[str, float]]]
+    ) -> Dict[str, float]:
+        """Compute average metrics across languages"""
+        avg_metrics = defaultdict(list)
+        
+        for lang_metrics in language_metrics.values():
+            for task, metrics in lang_metrics.items():
+                for name, value in metrics.items():
+                    avg_metrics[f'{task}_{name}'].append(value)
+        
+        return {
+            name: np.mean(values)
+            for name, values in avg_metrics.items()
+        }
+
+    def _compute_cross_lingual_metrics(self) -> Dict[str, float]:
+        """Compute cross-lingual transfer metrics"""
         metrics = {}
         
-        for metric_name, scores in self.episode_scores.items():
-            metrics[f'mean_{metric_name}'] = np.mean(scores)
-            metrics[f'std_{metric_name}'] = np.std(scores)
-            
-        # Compute adaptation rate
-        support_accuracies = self.episode_scores['support_accuracy']
-        adaptation_steps = self.episode_scores['adaptation_steps']
-        
-        if support_accuracies and adaptation_steps:
-            metrics['adaptation_rate'] = np.mean([
-                acc / steps
-                for acc, steps in zip(support_accuracies, adaptation_steps)
-            ])
-            
-        return metrics
-        
-    def compute_language_metrics(self) -> Dict[str, Dict[str, float]]:
-        """
-        Compute per-language metrics
-        
-        Returns:
-            Nested dictionary of metrics per language
-        """
-        language_metrics = {}
-        
-        for language, scores in self.language_scores.items():
-            language_metrics[language] = {
-                metric: np.mean(values)
-                for metric, values in scores.items()
+        for lang_pair, scores in self.cross_lingual_scores.items():
+            metrics[lang_pair] = {
+                'ner_transfer': np.mean([s['ner_f1'] for s in scores]),
+                'topic_transfer': np.mean([s['topic_acc'] for s in scores])
             }
-            
-        return language_metrics
         
-    def compute_cross_lingual_transfer(
-        self,
-        source_lang: str,
-        target_lang: str
-    ) -> float:
-        """
-        Compute cross-lingual transfer ratio
-        
-        Args:
-            source_lang: Source language code
-            target_lang: Target language code
-        Returns:
-            Transfer ratio score
-        """
-        source_f1 = np.mean(self.language_scores[source_lang]['ner_f1'])
-        target_f1 = np.mean(self.language_scores[target_lang]['ner_f1'])
-        
-        return (target_f1 / source_f1) if source_f1 > 0 else 0.0
-        
-    def get_all_metrics(self) -> Dict[str, Dict[str, float]]:
-        """
-        Compute and combine all metrics
-        
-        Returns:
-            Nested dictionary of all metrics
-        """
+        return metrics
+
+    def _compute_few_shot_metrics(self) -> Dict[str, float]:
+        """Compute few-shot learning metrics"""
         return {
-            'ner': self.compute_ner_metrics(),
-            'topic': self.compute_topic_metrics(),
-            'few_shot': self.compute_few_shot_metrics(),
-            'per_language': self.compute_language_metrics()
+            name: np.mean(scores) if scores else 0.0
+            for name, scores in self.episode_scores.items()
         }
-        
-    def log_metrics(self, metrics: Dict[str, Dict[str, float]]):
-        """
-        Log metrics using logger
-        
-        Args:
-            metrics: Dictionary of metrics to log
-        """
-        self.logger.info("=== Evaluation Metrics ===")
-        
-        for category, category_metrics in metrics.items():
-            self.logger.info(f"\n{category.upper()} Metrics:")
-            for name, value in category_metrics.items():
-                self.logger.info(f"{name}: {value:.4f}")

@@ -1,187 +1,177 @@
 import torch
 import torch.nn as nn
-import numpy as np
 from typing import Dict, List, Tuple, Optional
+import numpy as np
+from transformers import XLMRobertaModel
 from gensim.models import LdaModel
 from gensim.corpora import Dictionary
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
 
-class LDABertEncoder(nn.Module):
-    """
-    Combined LDA and BERT encoder for topic modeling
-    """
+class TopicPrototypeNetwork(nn.Module):
+    """Prototype network for topic modeling"""
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.num_topics = config.num_topics
-        self.bert_dim = config.bert_dim
-        self.hidden_dim = config.hidden_dim
-        
-        # BERT encoder (using Sentence-BERT)
-        self.sbert_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-        
-        # LDA model (initialized during training)
-        self.lda_model = None
-        self.dictionary = None
         
         # Projection layers
-        self.bert_projection = nn.Linear(self.bert_dim, self.hidden_dim)
-        self.lda_projection = nn.Linear(self.num_topics, self.hidden_dim)
-        
-        # Topic encoder
-        self.topic_encoder = nn.Sequential(
-            nn.Linear(2 * self.hidden_dim, self.hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(self.hidden_dim, self.num_topics)
-        )
-        
-    def train_lda(self, texts: List[List[str]]):
-        """
-        Train LDA model on preprocessed texts
-        
-        Args:
-            texts: List of tokenized documents
-        """
-        # Create dictionary
-        self.dictionary = Dictionary(texts)
-        
-        # Create corpus
-        corpus = [self.dictionary.doc2bow(text) for text in texts]
-        
-        # Train LDA model
-        self.lda_model = LdaModel(
-            corpus,
-            num_topics=self.num_topics,
-            id2word=self.dictionary,
-            passes=10,
-            alpha='auto',
-            random_state=42
-        )
-        
-    def get_lda_vectors(self, texts: List[List[str]]) -> torch.Tensor:
-        """
-        Get LDA topic distributions for texts
-        
-        Args:
-            texts: List of tokenized documents
-        Returns:
-            Tensor of topic distributions
-        """
-        if self.lda_model is None:
-            raise ValueError("LDA model not trained. Call train_lda first.")
-            
-        # Convert texts to corpus
-        corpus = [self.dictionary.doc2bow(text) for text in texts]
-        
-        # Get topic distributions
-        lda_vectors = []
-        for bow in corpus:
-            topic_dist = [0] * self.num_topics
-            for topic_id, prob in self.lda_model.get_document_topics(bow):
-                topic_dist[topic_id] = prob
-            lda_vectors.append(topic_dist)
-            
-        return torch.tensor(lda_vectors, dtype=torch.float)
-
-    def get_bert_embeddings(self, texts: List[str]) -> torch.Tensor:
-        """
-        Get BERT embeddings for texts
-        
-        Args:
-            texts: List of original (non-tokenized) texts
-        Returns:
-            Tensor of BERT embeddings
-        """
-        embeddings = self.sbert_model.encode(
-            texts,
-            batch_size=self.config.bert_batch_size,
-            show_progress_bar=False
-        )
-        return torch.tensor(embeddings, dtype=torch.float)
-
-class TopicBranch(nn.Module):
-    """
-    Topic Modeling branch of FewTopNER using LDA-BERT
-    """
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        
-        # LDA-BERT encoder
-        self.encoder = LDABertEncoder(config)
-        
-        # Prototype network for few-shot learning
-        self.prototype_network = nn.Sequential(
-            nn.Linear(config.hidden_dim, config.prototype_dim),
+        self.projector = nn.Sequential(
+            nn.Linear(config.topic_hidden_size, config.prototype_dim),
+            nn.LayerNorm(config.prototype_dim),
             nn.ReLU(),
             nn.Dropout(config.dropout),
             nn.Linear(config.prototype_dim, config.prototype_dim)
         )
         
-        # Topic classifier
-        self.classifier = nn.Linear(config.prototype_dim, config.num_topics)
+        # Learned temperature parameter
+        self.temperature = nn.Parameter(torch.tensor([1.0]))
         
-    def compute_prototypes(
-        self,
-        support_features: torch.Tensor,
-        support_labels: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute topic prototypes from support set
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.projector(features)
+    
+    def compute_similarities(self, query_features: torch.Tensor, support_features: torch.Tensor) -> torch.Tensor:
+        """Compute scaled cosine similarities"""
+        query_norm = query_features / query_features.norm(dim=-1, keepdim=True)
+        support_norm = support_features / support_features.norm(dim=-1, keepdim=True)
         
-        Args:
-            support_features: Encoded features from support set
-            support_labels: Topic labels for support set
-        Returns:
-            Tensor of topic prototypes
-        """
-        prototypes = []
-        for topic in range(self.config.num_topics):
-            # Get features for this topic
-            mask = (support_labels == topic)
-            if mask.sum() > 0:
-                topic_features = support_features[mask]
-                prototype = topic_features.mean(dim=0)
-                prototypes.append(prototype)
-            else:
-                # Create zero prototype if no examples
-                prototypes.append(torch.zeros_like(support_features[0]))
-                
-        return torch.stack(prototypes)
+        similarities = torch.matmul(query_norm, support_norm.transpose(-2, -1))
+        return similarities / self.temperature
 
+class TopicEncoder(nn.Module):
+    """Combined LDA and Transformer encoder for topic modeling"""
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        # Language-specific LDA models
+        self.lda_models = {}
+        self.dictionaries = {}
+        
+        # Language adapters
+        self.language_adapters = nn.ModuleDict({
+            lang: nn.Sequential(
+                nn.Linear(config.hidden_size, config.hidden_size),
+                nn.LayerNorm(config.hidden_size),
+                nn.ReLU(),
+                nn.Linear(config.hidden_size, config.hidden_size)
+            )
+            for lang in ['en', 'fr', 'de', 'es', 'it']
+        })
+        
+        # Feature fusion
+        self.topic_fusion = nn.Sequential(
+            nn.Linear(config.hidden_size + config.num_topics, config.topic_hidden_size),
+            nn.LayerNorm(config.topic_hidden_size),
+            nn.ReLU(),
+            nn.Dropout(config.dropout)
+        )
+
+    def set_lda_model(self, language: str, lda_model: LdaModel, dictionary: Dictionary):
+        """Set LDA model for a specific language"""
+        self.lda_models[language] = lda_model
+        self.dictionaries[language] = dictionary
+    
+    def get_lda_features(self, texts: List[str], language: str) -> torch.Tensor:
+        """Get LDA topic distributions"""
+        if language not in self.lda_models:
+            raise ValueError(f"No LDA model found for language: {language}")
+            
+        lda_model = self.lda_models[language]
+        dictionary = self.dictionaries[language]
+        
+        # Convert texts to BOW
+        bows = [dictionary.doc2bow(text.split()) for text in texts]
+        
+        # Get topic distributions
+        topic_dists = []
+        for bow in bows:
+            dist = np.zeros(self.config.num_topics)
+            for topic_id, prob in lda_model.get_document_topics(bow):
+                dist[topic_id] = prob
+            topic_dists.append(dist)
+            
+        return torch.tensor(topic_dists, dtype=torch.float)
+    
     def forward(
         self,
+        sequence_output: torch.Tensor,
+        attention_mask: torch.Tensor,
         texts: List[str],
-        tokenized_texts: List[List[str]],
-        support_set: Optional[Dict] = None
-    ) -> Dict:
+        language_ids: torch.Tensor,
+        languages: List[str]
+    ) -> torch.Tensor:
         """
-        Forward pass through topic branch
+        Encode topics with language-specific processing
         
         Args:
+            sequence_output: XLM-R outputs [batch_size, seq_len, hidden_size]
+            attention_mask: Attention mask [batch_size, seq_len]
             texts: Original texts
-            tokenized_texts: Tokenized texts for LDA
-            support_set: Optional support set for few-shot learning
-        Returns:
-            Dictionary containing outputs and loss
+            language_ids: Language identifiers [batch_size]
+            languages: List of language codes
         """
-        # Get LDA vectors
-        lda_vectors = self.encoder.get_lda_vectors(tokenized_texts)
+        batch_size = sequence_output.size(0)
         
-        # Get BERT embeddings
-        bert_embeddings = self.encoder.get_bert_embeddings(texts)
+        # Apply language-specific adapters
+        adapted_outputs = torch.zeros_like(sequence_output)
+        for lang_id, lang in enumerate(languages):
+            lang_mask = (language_ids == lang_id).view(-1, 1, 1)
+            adapted_outputs += lang_mask * self.language_adapters[lang](sequence_output)
         
-        # Project both representations
-        lda_projected = self.encoder.lda_projection(lda_vectors)
-        bert_projected = self.encoder.bert_projection(bert_embeddings)
+        # Pool sequence outputs
+        masked_outputs = adapted_outputs * attention_mask.unsqueeze(-1)
+        pooled_outputs = masked_outputs.sum(1) / attention_mask.sum(1).unsqueeze(-1)
         
-        # Combine representations
-        combined = torch.cat([lda_projected, bert_projected], dim=-1)
+        # Get LDA features for each language
+        lda_features = []
+        for i, text in enumerate(texts):
+            lang = languages[language_ids[i]]
+            lda_feat = self.get_lda_features([text], lang)
+            lda_features.append(lda_feat)
+        lda_features = torch.cat(lda_features, dim=0)
         
+        # Combine features
+        combined_features = torch.cat([pooled_outputs, lda_features], dim=-1)
+        topic_features = self.topic_fusion(combined_features)
+        
+        return topic_features
+
+class TopicBranch(nn.Module):
+    """Topic modeling branch with prototype learning"""
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        # Topic encoder
+        self.encoder = TopicEncoder(config)
+        
+        # Prototype network
+        self.prototype_network = TopicPrototypeNetwork(config)
+        
+        # Topic classifier
+        self.topic_classifier = nn.Linear(config.prototype_dim, config.num_topics)
+        
+        # Loss weights
+        self.prototype_weight = config.prototype_weight
+        self.classification_weight = config.classification_weight
+    
+    def forward(
+        self,
+        sequence_output: torch.Tensor,
+        attention_mask: torch.Tensor,
+        texts: List[str],
+        language_ids: torch.Tensor,
+        languages: List[str],
+        support_set: Optional[Dict] = None,
+        labels: Optional[torch.Tensor] = None
+    ) -> Dict:
+        """Forward pass for topic branch"""
         # Encode topics
-        topic_features = self.encoder.topic_encoder(combined)
+        topic_features = self.encoder(
+            sequence_output,
+            attention_mask,
+            texts,
+            language_ids,
+            languages
+        )
         
         # Get prototype features
         prototype_features = self.prototype_network(topic_features)
@@ -191,48 +181,41 @@ class TopicBranch(nn.Module):
             'prototype_features': prototype_features
         }
         
-        # Few-shot learning with support set
         if support_set is not None:
-            prototypes = self.compute_prototypes(
-                support_set['prototype_features'],
-                support_set['labels']
+            # Few-shot mode
+            support_features = self.prototype_network(support_set['topic_features'])
+            
+            # Compute similarities to support set
+            similarities = self.prototype_network.compute_similarities(
+                prototype_features,
+                support_features
             )
+            outputs['similarities'] = similarities
             
-            # Compute distances to prototypes
-            distances = torch.cdist(prototype_features, prototypes)
-            logits = -distances
-            
-            outputs['logits'] = logits
+            if labels is not None:
+                prototype_loss = nn.CrossEntropyLoss()(similarities, labels)
+                outputs['prototype_loss'] = prototype_loss
         else:
-            # Regular classification
-            logits = self.classifier(prototype_features)
+            # Regular classification mode
+            logits = self.topic_classifier(prototype_features)
             outputs['logits'] = logits
             
+            if labels is not None:
+                classification_loss = nn.CrossEntropyLoss()(logits, labels)
+                outputs['classification_loss'] = classification_loss
+        
+        # Compute total loss if in training mode
+        if labels is not None:
+            total_loss = 0
+            if 'prototype_loss' in outputs:
+                total_loss += self.prototype_weight * outputs['prototype_loss']
+            if 'classification_loss' in outputs:
+                total_loss += self.classification_weight * outputs['classification_loss']
+            outputs['loss'] = total_loss
+        
         return outputs
-
-    def compute_loss(
-        self,
-        outputs: Dict,
-        labels: torch.Tensor,
-        reduction: str = 'mean'
-    ) -> torch.Tensor:
-        """
-        Compute loss for topic modeling
-        
-        Args:
-            outputs: Forward pass outputs
-            labels: Topic labels
-            reduction: Loss reduction method
-        Returns:
-            Loss tensor
-        """
-        logits = outputs['logits']
-        
-        if reduction == 'none':
-            return nn.functional.cross_entropy(
-                logits,
-                labels,
-                reduction='none'
-            )
-        
-        return nn.functional.cross_entropy(logits, labels)
+    
+    def set_lda_models(self, lda_models: Dict[str, Tuple[LdaModel, Dictionary]]):
+        """Set LDA models for all languages"""
+        for lang, (lda_model, dictionary) in lda_models.items():
+            self.encoder.set_lda_model(lang, lda_model, dictionary)

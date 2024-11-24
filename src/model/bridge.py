@@ -1,29 +1,37 @@
 import torch
 import torch.nn as nn
-import math
+import torch.nn.functional as F
 from typing import Dict, Tuple, Optional
 import logging
+import math
+
+logger = logging.getLogger(__name__)
 
 class CrossTaskAttention(nn.Module):
-    """
-    Multi-head attention for cross-task feature integration
-    """
+    """Enhanced multi-head attention for NER and Topic feature integration"""
     def __init__(self, config):
         super().__init__()
-        self.config = config
         
         # Multi-head attention parameters
-        self.num_heads = config.num_attention_heads
+        self.num_heads = config.bridge_num_heads
         self.head_dim = config.hidden_size // self.num_heads
         self.scaling = self.head_dim ** -0.5
         
-        # Projections for queries, keys, and values
-        self.q_proj = nn.Linear(config.hidden_size, config.hidden_size)
-        self.k_proj = nn.Linear(config.hidden_size, config.hidden_size)
-        self.v_proj = nn.Linear(config.hidden_size, config.hidden_size)
-        self.out_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        # Task-specific projections
+        self.ner_q_proj = nn.Linear(config.entity_feature_size, config.hidden_size)
+        self.ner_k_proj = nn.Linear(config.entity_feature_size, config.hidden_size)
+        self.ner_v_proj = nn.Linear(config.entity_feature_size, config.hidden_size)
         
-        # Dropout for attention weights
+        self.topic_q_proj = nn.Linear(config.topic_feature_size, config.hidden_size)
+        self.topic_k_proj = nn.Linear(config.topic_feature_size, config.hidden_size)
+        self.topic_v_proj = nn.Linear(config.topic_feature_size, config.hidden_size)
+        
+        # Language-specific biases
+        self.language_biases = nn.ParameterDict({
+            lang: nn.Parameter(torch.zeros(config.hidden_size))
+            for lang in ['en', 'fr', 'de', 'es', 'it']
+        })
+        
         self.dropout = nn.Dropout(config.attention_dropout)
         
     def forward(
@@ -31,27 +39,34 @@ class CrossTaskAttention(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        query_type: str,  # 'ner' or 'topic'
+        language_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute cross-task attention
-        
-        Args:
-            query: Query tensor [batch_size, seq_len, hidden_size]
-            key: Key tensor [batch_size, seq_len, hidden_size]
-            value: Value tensor [batch_size, seq_len, hidden_size]
-            attention_mask: Optional mask tensor
-        Returns:
-            Tuple of (output tensor, attention weights)
-        """
+        """Cross-task attention with language awareness"""
         batch_size = query.size(0)
         
-        # Project and reshape for multi-head attention
-        q = self.q_proj(query).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(key).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(value).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        # Select task-specific projections
+        if query_type == 'ner':
+            q_proj = self.ner_q_proj
+            k_proj = self.topic_k_proj
+            v_proj = self.topic_v_proj
+        else:
+            q_proj = self.topic_q_proj
+            k_proj = self.ner_k_proj
+            v_proj = self.ner_v_proj
         
-        # Compute attention scores
+        # Project and reshape
+        q = q_proj(query).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k_proj(key).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v_proj(value).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Add language-specific biases
+        for lang_id, bias in enumerate(self.language_biases.values()):
+            lang_mask = (language_ids == lang_id).view(-1, 1, 1, 1)
+            q = q + (lang_mask * bias.view(1, 1, 1, -1))
+        
+        # Compute attention with relative position bias
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
         
         if attention_mask is not None:
@@ -60,189 +75,194 @@ class CrossTaskAttention(nn.Module):
                 float('-inf')
             )
         
-        # Compute attention weights and apply dropout
-        attn_weights = torch.softmax(scores, dim=-1)
+        attn_weights = F.softmax(scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
         
-        # Apply attention to values
         context = torch.matmul(attn_weights, v)
-        
-        # Reshape and project output
         context = context.transpose(1, 2).contiguous().view(
-            batch_size, -1, self.config.hidden_size
+            batch_size, -1, self.head_dim * self.num_heads
         )
-        output = self.out_proj(context)
         
-        return output, attn_weights
+        return context, attn_weights
 
-class GatingMechanism(nn.Module):
-    """
-    Gating mechanism for controlled feature integration
-    """
+class TaskGating(nn.Module):
+    """Enhanced gating mechanism with task and language awareness"""
     def __init__(self, config):
         super().__init__()
         
-        # Feature transformation
-        self.entity_transform = nn.Linear(config.entity_feature_size, config.hidden_size)
-        self.topic_transform = nn.Linear(config.topic_feature_size, config.hidden_size)
-        
-        # Gate networks
-        self.entity_gate = nn.Sequential(
-            nn.Linear(config.hidden_size * 2, config.hidden_size),
-            nn.ReLU(),
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.Sigmoid()
+        # Task-specific transformations
+        self.ner_transform = nn.Sequential(
+            nn.Linear(config.entity_feature_size, config.hidden_size),
+            nn.LayerNorm(config.hidden_size),
+            nn.ReLU()
         )
         
-        self.topic_gate = nn.Sequential(
-            nn.Linear(config.hidden_size * 2, config.hidden_size),
-            nn.ReLU(),
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.Sigmoid()
+        self.topic_transform = nn.Sequential(
+            nn.Linear(config.topic_feature_size, config.hidden_size),
+            nn.LayerNorm(config.hidden_size),
+            nn.ReLU()
         )
+        
+        # Language-aware gate networks
+        self.gate_networks = nn.ModuleDict({
+            lang: nn.Sequential(
+                nn.Linear(config.hidden_size * 2, config.hidden_size),
+                nn.LayerNorm(config.hidden_size),
+                nn.ReLU(),
+                nn.Linear(config.hidden_size, 2),  # 2 gates: one for each task
+                nn.Sigmoid()
+            )
+            for lang in ['en', 'fr', 'de', 'es', 'it']
+        })
         
         self.dropout = nn.Dropout(config.dropout)
         
     def forward(
         self,
-        entity_features: torch.Tensor,
-        topic_features: torch.Tensor
+        ner_features: torch.Tensor,
+        topic_features: torch.Tensor,
+        language_ids: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Apply gating mechanism for feature integration
-        
-        Args:
-            entity_features: Entity features
-            topic_features: Topic features
-        Returns:
-            Tuple of (gated entity features, gated topic features)
-        """
-        # Transform features to common space
-        entity_transformed = self.entity_transform(entity_features)
+        """Language-aware gating"""
+        # Transform features
+        ner_transformed = self.ner_transform(ner_features)
         topic_transformed = self.topic_transform(topic_features)
         
-        # Compute gate values
-        combined = torch.cat([entity_transformed, topic_transformed], dim=-1)
-        entity_gate_values = self.entity_gate(combined)
-        topic_gate_values = self.topic_gate(combined)
+        # Compute gates for each language
+        combined = torch.cat([ner_transformed, topic_transformed], dim=-1)
+        gates = torch.zeros(combined.size(0), combined.size(1), 2).to(combined.device)
+        
+        for lang_id, gate_network in enumerate(self.gate_networks.values()):
+            lang_mask = (language_ids == lang_id).view(-1, 1, 1)
+            gates += lang_mask * gate_network(combined)
         
         # Apply gates
-        gated_entity = entity_transformed * entity_gate_values
-        gated_topic = topic_transformed * topic_gate_values
+        gated_ner = ner_transformed * gates[..., 0].unsqueeze(-1)
+        gated_topic = topic_transformed * gates[..., 1].unsqueeze(-1)
         
-        return self.dropout(gated_entity), self.dropout(gated_topic)
+        return self.dropout(gated_ner), self.dropout(gated_topic)
 
 class LightweightBridge(nn.Module):
-    """
-    Lightweight bridge for cross-task feature integration
-    """
+    """Enhanced bridge module for cross-task and cross-lingual integration"""
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.logger = logging.getLogger(__name__)
         
         # Cross-task attention
         self.cross_attention = CrossTaskAttention(config)
         
-        # Gating mechanism
-        self.gating = GatingMechanism(config)
+        # Task gating
+        self.gating = TaskGating(config)
         
-        # Feature fusion
-        self.entity_fusion = nn.Sequential(
-            nn.Linear(config.hidden_size * 2, config.hidden_size),
-            nn.LayerNorm(config.hidden_size),
-            nn.ReLU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.hidden_size, config.entity_feature_size)
-        )
+        # Feature fusion with language adaptation
+        self.ner_fusion = nn.ModuleDict({
+            lang: nn.Sequential(
+                nn.Linear(config.hidden_size * 2, config.hidden_size),
+                nn.LayerNorm(config.hidden_size),
+                nn.ReLU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(config.hidden_size, config.entity_feature_size)
+            )
+            for lang in ['en', 'fr', 'de', 'es', 'it']
+        })
         
-        self.topic_fusion = nn.Sequential(
-            nn.Linear(config.hidden_size * 2, config.hidden_size),
-            nn.LayerNorm(config.hidden_size),
-            nn.ReLU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.hidden_size, config.topic_feature_size)
-        )
+        self.topic_fusion = nn.ModuleDict({
+            lang: nn.Sequential(
+                nn.Linear(config.hidden_size * 2, config.hidden_size),
+                nn.LayerNorm(config.hidden_size),
+                nn.ReLU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(config.hidden_size, config.topic_feature_size)
+            )
+            for lang in ['en', 'fr', 'de', 'es', 'it']
+        })
         
-        # Task-specific layer normalization
-        self.entity_norm = nn.LayerNorm(config.entity_feature_size)
+        # Task-specific normalization
+        self.ner_norm = nn.LayerNorm(config.entity_feature_size)
         self.topic_norm = nn.LayerNorm(config.topic_feature_size)
         
     def forward(
         self,
-        entity_features: torch.Tensor,
+        ner_features: torch.Tensor,
         topic_features: torch.Tensor,
+        language_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
-        """
-        Integrate features between NER and Topic Modeling tasks
-        
-        Args:
-            entity_features: Entity features [batch_size, seq_len, entity_feature_size]
-            topic_features: Topic features [batch_size, seq_len, topic_feature_size]
-            attention_mask: Optional attention mask
-        Returns:
-            Dictionary containing enhanced features and attention weights
-        """
-        # Gate features
-        gated_entity, gated_topic = self.gating(entity_features, topic_features)
-        
-        # Cross-task attention from entity to topic
-        entity_context, entity_attn = self.cross_attention(
-            gated_entity, gated_topic, gated_topic, attention_mask
+        """Enhanced cross-task integration"""
+        # Gate features with language awareness
+        gated_ner, gated_topic = self.gating(
+            ner_features, 
+            topic_features, 
+            language_ids
         )
         
-        # Cross-task attention from topic to entity
+        # Cross-task attention
+        ner_context, ner_attn = self.cross_attention(
+            gated_ner, gated_topic, gated_topic,
+            query_type='ner',
+            language_ids=language_ids,
+            attention_mask=attention_mask
+        )
+        
         topic_context, topic_attn = self.cross_attention(
-            gated_topic, gated_entity, gated_entity, attention_mask
+            gated_topic, gated_ner, gated_ner,
+            query_type='topic',
+            language_ids=language_ids,
+            attention_mask=attention_mask
         )
         
-        # Combine original and context features
-        enhanced_entity = torch.cat([gated_entity, entity_context], dim=-1)
-        enhanced_topic = torch.cat([gated_topic, topic_context], dim=-1)
+        # Language-specific feature fusion
+        enhanced_ner = torch.zeros_like(ner_features)
+        enhanced_topic = torch.zeros_like(topic_features)
         
-        # Feature fusion
-        final_entity = self.entity_fusion(enhanced_entity)
-        final_topic = self.topic_fusion(enhanced_topic)
+        for lang_id, (ner_fuser, topic_fuser) in enumerate(zip(
+            self.ner_fusion.values(), self.topic_fusion.values())):
+            lang_mask = (language_ids == lang_id).view(-1, 1, 1)
+            
+            ner_combined = torch.cat([gated_ner, ner_context], dim=-1)
+            topic_combined = torch.cat([gated_topic, topic_context], dim=-1)
+            
+            enhanced_ner += lang_mask * ner_fuser(ner_combined)
+            enhanced_topic += lang_mask * topic_fuser(topic_combined)
         
-        # Residual connection and normalization
-        final_entity = self.entity_norm(final_entity + entity_features)
-        final_topic = self.topic_norm(final_topic + topic_features)
+        # Residual connections and normalization
+        final_ner = self.ner_norm(enhanced_ner + ner_features)
+        final_topic = self.topic_norm(enhanced_topic + topic_features)
         
         return {
-            'entity_features': final_entity,
+            'ner_features': final_ner,
             'topic_features': final_topic,
-            'entity_attention': entity_attn,
-            'topic_attention': topic_attn
+            'ner_attention': ner_attn,
+            'topic_attention': topic_attn,
+            'gates': {
+                'ner': gated_ner,
+                'topic': gated_topic
+            }
         }
     
-    def compute_cross_task_loss(
+    def compute_alignment_loss(
         self,
-        entity_features: torch.Tensor,
-        topic_features: torch.Tensor,
-        entity_labels: torch.Tensor,
-        topic_labels: torch.Tensor,
+        outputs: Dict[str, torch.Tensor],
+        ner_labels: torch.Tensor,
         attention_mask: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Compute additional loss to encourage meaningful cross-task interactions
-        """
-        # Get enhanced features
-        outputs = self.forward(entity_features, topic_features, attention_mask)
-        
-        # Compute consistency loss between tasks
-        entity_attn = outputs['entity_attention']
+        """Compute loss to encourage task alignment"""
+        ner_attn = outputs['ner_attention']
         topic_attn = outputs['topic_attention']
         
-        # Encourage attention to relevant parts based on labels
-        entity_mask = (entity_labels != -100).float()
-        topic_mask = (topic_labels != -100).float()
+        # Create label-based attention mask
+        label_mask = (ner_labels != -100).float()
         
-        consistency_loss = torch.mean(
-            torch.abs(
-                torch.bmm(entity_attn, topic_attn.transpose(-2, -1)) - \
-                torch.eye(entity_attn.size(-1), device=entity_attn.device)
-            )
+        # Compute attention consistency loss
+        consistency_loss = F.mse_loss(
+            torch.bmm(ner_attn, topic_attn.transpose(-2, -1)),
+            torch.eye(ner_attn.size(-1), device=ner_attn.device).expand(
+                ner_attn.size(0), -1, -1
+            ),
+            reduction='none'
         )
         
-        return self.config.consistency_weight * consistency_loss
+        # Apply masks
+        masked_loss = consistency_loss * label_mask.unsqueeze(1) * attention_mask.unsqueeze(2)
+        
+        return masked_loss.sum() / (label_mask.sum() + 1e-6)

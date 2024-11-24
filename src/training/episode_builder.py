@@ -4,291 +4,236 @@ from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 import random
 import logging
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
+
+logger = logging.getLogger(__name__)
 
 class EpisodeBuilder:
-    """
-    Builds few-shot episodes for training FewTopNER
-    """
+    """Episode builder aligned with FewTopNER trainer"""
+    
     def __init__(self, config):
         self.config = config
-        self.logger = logging.getLogger(__name__)
         
         # Episode settings
         self.n_way = config.n_way
         self.k_shot = config.k_shot
         self.n_query = config.n_query
-        self.min_examples_per_class = config.min_examples_per_class
+        self.min_examples = config.min_examples_per_class
+        self.batch_size = config.batch_size
         
-    def create_entity_episode(
+        # Language settings
+        self.languages = ['en', 'fr', 'de', 'es', 'it']
+        self.num_languages_per_episode = config.num_languages_per_episode
+        
+        # NER label mapping from WikiNEuRal
+        self.ner_labels = {
+            'O': 0,
+            'B-PER': 1, 'I-PER': 2,
+            'B-ORG': 3, 'I-ORG': 4,
+            'B-LOC': 5, 'I-LOC': 6,
+            'B-MISC': 7, 'I-MISC': 8
+        }
+    
+    def create_episode(
         self,
-        dataset: Dataset,
-        entity_types: Optional[List[str]] = None
-    ) -> Tuple[Dict, Dict]:
+        datasets: Dict[str, Dataset]
+    ) -> Tuple[DataLoader, DataLoader]:
         """
-        Create episode for entity recognition
+        Create a single episode with support and query loaders
         
         Args:
-            dataset: Source dataset
-            entity_types: Optional list of entity types to include
+            datasets: Dictionary of datasets by language
         Returns:
-            Tuple of (support set, query set)
+            Tuple of (support_loader, query_loader)
         """
-        # Group examples by entity type
+        # Select languages for this episode
+        episode_langs = random.sample(
+            self.languages,
+            min(self.num_languages_per_episode, len(self.languages))
+        )
+        
+        # Collect examples for support and query sets
+        support_examples = []
+        query_examples = []
+        
+        for lang_idx, lang in enumerate(episode_langs):
+            dataset = datasets[lang]
+            lang_support, lang_query = self._sample_language_examples(
+                dataset,
+                lang_idx
+            )
+            support_examples.extend(lang_support)
+            query_examples.extend(lang_query)
+        
+        # Create loaders
+        support_loader = DataLoader(
+            support_examples,
+            batch_size=self.config.support_batch_size,
+            shuffle=True,
+            collate_fn=self._collate_fn
+        )
+        
+        query_loader = DataLoader(
+            query_examples,
+            batch_size=self.config.query_batch_size,
+            shuffle=True,
+            collate_fn=self._collate_fn
+        )
+        
+        return support_loader, query_loader
+    
+    def _sample_language_examples(
+        self,
+        dataset: Dataset,
+        lang_idx: int
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """Sample examples for one language"""
+        # Group by entity types
         entity_examples = defaultdict(list)
         
         for idx in range(len(dataset)):
             example = dataset[idx]
             labels = example['entity_labels']
             
-            # Get unique entity types in this example
+            # Get unique entity types
             unique_entities = set(
                 label.item() for label in labels
-                if label != -100 and label != self.config.o_label
+                if label != -100 and label != self.ner_labels['O']
             )
             
-            # Add example to all its entity types
+            # Add to all relevant entity types
             for entity_type in unique_entities:
-                if entity_types is None or entity_type in entity_types:
-                    entity_examples[entity_type].append(idx)
-                    
-        # Select entity types for this episode
+                entity_examples[entity_type].append(example)
+        
+        # Sample for support and query sets
+        support_examples = []
+        query_examples = []
+        
+        # Select entity types
         available_types = [
             ent_type for ent_type, examples in entity_examples.items()
-            if len(examples) >= self.min_examples_per_class
+            if len(examples) >= self.k_shot + self.n_query
         ]
         
-        if len(available_types) < self.n_way:
-            self.logger.warning(
-                f"Only {len(available_types)} entity types available for episode"
-            )
-            return None, None
+        if len(available_types) >= self.n_way:
+            selected_types = random.sample(available_types, self.n_way)
             
-        selected_types = random.sample(available_types, self.n_way)
-        
-        # Build support and query sets
-        support_indices = []
-        query_indices = []
-        
-        for entity_type in selected_types:
-            examples = entity_examples[entity_type]
-            selected = random.sample(examples, self.k_shot + self.n_query)
-            
-            support_indices.extend(selected[:self.k_shot])
-            query_indices.extend(selected[self.k_shot:])
-            
-        return self._create_sets(dataset, support_indices, query_indices)
-        
-    def create_topic_episode(
-        self,
-        dataset: Dataset,
-        topics: Optional[List[int]] = None
-    ) -> Tuple[Dict, Dict]:
-        """
-        Create episode for topic modeling
-        
-        Args:
-            dataset: Source dataset
-            topics: Optional list of topics to include
-        Returns:
-            Tuple of (support set, query set)
-        """
-        # Group examples by topic
-        topic_examples = defaultdict(list)
-        
-        for idx in range(len(dataset)):
-            example = dataset[idx]
-            topic = example['topic_label'].item()
-            
-            if topics is None or topic in topics:
-                topic_examples[topic].append(idx)
+            for entity_type in selected_types:
+                examples = entity_examples[entity_type]
+                selected = random.sample(examples, self.k_shot + self.n_query)
                 
-        # Select topics for this episode
-        available_topics = [
-            topic for topic, examples in topic_examples.items()
-            if len(examples) >= self.min_examples_per_class
-        ]
+                # Add language ID to examples
+                for example in selected:
+                    example['language_id'] = lang_idx
+                
+                support_examples.extend(selected[:self.k_shot])
+                query_examples.extend(selected[self.k_shot:])
         
-        if len(available_topics) < self.n_way:
-            self.logger.warning(
-                f"Only {len(available_topics)} topics available for episode"
-            )
-            return None, None
-            
-        selected_topics = random.sample(available_topics, self.n_way)
+        return support_examples, query_examples
+    
+    def _collate_fn(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
+        """Collate batch of examples"""
+        # Initialize batch dictionary
+        batch_dict = {
+            'input_ids': [],
+            'attention_mask': [],
+            'entity_labels': [],
+            'topic_labels': [],
+            'language_ids': [],
+            'texts': []
+        }
         
-        # Build support and query sets
-        support_indices = []
-        query_indices = []
-        
-        for topic in selected_topics:
-            examples = topic_examples[topic]
-            selected = random.sample(examples, self.k_shot + self.n_query)
-            
-            support_indices.extend(selected[:self.k_shot])
-            query_indices.extend(selected[self.k_shot:])
-            
-        return self._create_sets(dataset, support_indices, query_indices)
-        
-    def create_joint_episode(
-        self,
-        dataset: Dataset,
-        balance_tasks: bool = True
-    ) -> Tuple[Dict, Dict]:
-        """
-        Create episode balancing both entity and topic tasks
-        
-        Args:
-            dataset: Source dataset
-            balance_tasks: Whether to ensure balance between tasks
-        Returns:
-            Tuple of (support set, query set)
-        """
-        # Create separate episodes for each task
-        entity_support, entity_query = self.create_entity_episode(dataset)
-        topic_support, topic_query = self.create_topic_episode(dataset)
-        
-        if entity_support is None or topic_support is None:
-            return None, None
-            
-        if balance_tasks:
-            # Ensure equal representation of both tasks
-            min_support = min(len(entity_support['input_ids']), 
-                            len(topic_support['input_ids']))
-            min_query = min(len(entity_query['input_ids']), 
-                          len(topic_query['input_ids']))
-            
-            # Randomly select examples to maintain balance
-            support_indices = random.sample(range(len(entity_support['input_ids'])), 
-                                         min_support)
-            query_indices = random.sample(range(len(entity_query['input_ids'])), 
-                                       min_query)
-            
-            entity_support = self._select_indices(entity_support, support_indices)
-            entity_query = self._select_indices(entity_query, query_indices)
-            
-            support_indices = random.sample(range(len(topic_support['input_ids'])), 
-                                         min_support)
-            query_indices = random.sample(range(len(topic_query['input_ids'])), 
-                                       min_query)
-            
-            topic_support = self._select_indices(topic_support, support_indices)
-            topic_query = self._select_indices(topic_query, query_indices)
-            
-        # Combine episodes
-        support_set = self._merge_sets(entity_support, topic_support)
-        query_set = self._merge_sets(entity_query, topic_query)
-        
-        return support_set, query_set
-        
-    def create_episodes(
-        self,
-        dataset: Dataset,
-        num_episodes: int,
-        joint: bool = True
-    ) -> List[Tuple[Dict, Dict]]:
-        """
-        Create multiple episodes for training
-        
-        Args:
-            dataset: Source dataset
-            num_episodes: Number of episodes to create
-            joint: Whether to create joint episodes
-        Returns:
-            List of (support set, query set) pairs
-        """
-        episodes = []
-        
-        for _ in range(num_episodes):
-            if joint:
-                support_set, query_set = self.create_joint_episode(dataset)
-            else:
-                # Alternate between entity and topic episodes
-                if len(episodes) % 2 == 0:
-                    support_set, query_set = self.create_entity_episode(dataset)
+        # Collect tensors
+        for example in batch:
+            for key in batch_dict:
+                if key == 'texts':
+                    batch_dict[key].append(example.get('text', ''))
+                elif key == 'language_ids':
+                    batch_dict[key].append(example['language_id'])
                 else:
-                    support_set, query_set = self.create_topic_episode(dataset)
-                    
-            if support_set is not None and query_set is not None:
-                episodes.append((support_set, query_set))
-                
-        return episodes
+                    batch_dict[key].append(example[key])
         
-    def _create_sets(
+        # Convert to tensors
+        for key in batch_dict:
+            if key not in ['texts', 'language_ids']:
+                batch_dict[key] = torch.stack(batch_dict[key])
+            elif key == 'language_ids':
+                batch_dict[key] = torch.tensor(batch_dict[key])
+        
+        return batch_dict
+    
+    def create_episode_loader(
         self,
-        dataset: Dataset,
-        support_indices: List[int],
-        query_indices: List[int]
-    ) -> Tuple[Dict, Dict]:
+        datasets: Dict[str, Dataset],
+        num_episodes: int,
+        infinite: bool = True
+    ):
         """
-        Create support and query sets from indices
+        Create an episode loader compatible with the trainer
+        
+        Args:
+            datasets: Dictionary of datasets by language
+            num_episodes: Number of episodes to create
+            infinite: Whether to loop infinitely
         """
-        support_set = {
-            'input_ids': [],
-            'attention_mask': [],
-            'entity_labels': [],
-            'topic_labels': [],
-            'language': []
-        }
-        
-        query_set = {
-            'input_ids': [],
-            'attention_mask': [],
-            'entity_labels': [],
-            'topic_labels': [],
-            'language': []
-        }
-        
-        # Collect support set examples
-        for idx in support_indices:
-            example = dataset[idx]
-            for key in support_set:
-                support_set[key].append(example[key])
+        while True:
+            for _ in range(num_episodes):
+                support_loader, query_loader = self.create_episode(datasets)
                 
-        # Collect query set examples
-        for idx in query_indices:
-            example = dataset[idx]
-            for key in query_set:
-                query_set[key].append(example[key])
+                # Sample a batch for the bridge
+                bridge_batch = next(iter(support_loader))
                 
-        # Convert lists to tensors
-        support_set = {
-            k: torch.stack(v) if k != 'language' else v
-            for k, v in support_set.items()
-        }
-        
-        query_set = {
-            k: torch.stack(v) if k != 'language' else v
-            for k, v in query_set.items()
-        }
-        
-        return support_set, query_set
-        
-    def _select_indices(
+                yield bridge_batch, support_loader, query_loader
+            
+            if not infinite:
+                break
+
+    def get_dataloader(
         self,
-        data_dict: Dict,
-        indices: List[int]
-    ) -> Dict:
+        support_set: Dict[str, torch.Tensor],
+        query_set: Dict[str, torch.Tensor],
+        support_batch_size: int,
+        query_batch_size: int
+    ) -> Tuple[DataLoader, DataLoader]:
         """
-        Select specific indices from a dictionary of tensors
-        """
-        return {
-            k: v[indices] if k != 'language' else [v[i] for i in indices]
-            for k, v in data_dict.items()
-        }
+        Create dataloaders from support and query sets
         
-    def _merge_sets(
-        self,
-        set1: Dict,
-        set2: Dict
-    ) -> Dict:
+        Args:
+            support_set: Support set tensors
+            query_set: Query set tensors
+            support_batch_size: Batch size for support set
+            query_batch_size: Batch size for query set
+        Returns:
+            Support and query dataloaders
         """
-        Merge two sets of examples
-        """
-        merged = {}
-        for key in set1:
-            if key == 'language':
-                merged[key] = set1[key] + set2[key]
-            else:
-                merged[key] = torch.cat([set1[key], set2[key]], dim=0)
-        return merged
+        # Create tensor datasets
+        support_dataset = TensorDataset(
+            support_set['input_ids'],
+            support_set['attention_mask'],
+            support_set['entity_labels'],
+            support_set['topic_labels'],
+            support_set['language_ids']
+        )
+        
+        query_dataset = TensorDataset(
+            query_set['input_ids'],
+            query_set['attention_mask'],
+            query_set['entity_labels'],
+            query_set['topic_labels'],
+            query_set['language_ids']
+        )
+        
+        # Create dataloaders
+        support_loader = DataLoader(
+            support_dataset,
+            batch_size=support_batch_size,
+            shuffle=True
+        )
+        
+        query_loader = DataLoader(
+            query_dataset,
+            batch_size=query_batch_size,
+            shuffle=True
+        )
+        
+        return support_loader, query_loader

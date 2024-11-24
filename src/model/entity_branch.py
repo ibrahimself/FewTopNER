@@ -3,16 +3,56 @@ import torch.nn as nn
 from torchcrf import CRF
 from typing import Dict, List, Tuple, Optional
 import numpy as np
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
-class EntityEncoder(nn.Module):
-    """
-    Encoder for entity recognition with BiLSTM
-    """
+class EntityPrototypeNetwork(nn.Module):
+    """Prototype network for entity features"""
     def __init__(self, config):
         super().__init__()
         self.config = config
         
-        # BiLSTM for sequence encoding
+        # Projection layers
+        self.projector = nn.Sequential(
+            nn.Linear(config.entity_feature_size, config.prototype_dim),
+            nn.LayerNorm(config.prototype_dim),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.prototype_dim, config.prototype_dim)
+        )
+        
+        # Initialize prototype memory
+        self.register_buffer(
+            'prototypes',
+            torch.zeros(config.num_entity_labels, config.prototype_dim)
+        )
+        
+        # Temperature parameter for distance scaling
+        self.temperature = nn.Parameter(torch.tensor([1.0]))
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        """Project features to prototype space"""
+        return self.projector(features)
+    
+    def compute_prototype_loss(self, features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Compute loss for prototype learning"""
+        # Compute distances to prototypes
+        distances = torch.cdist(features, self.prototypes)
+        
+        # Scale distances by learned temperature
+        scaled_distances = -distances / self.temperature
+        
+        # Cross entropy loss
+        loss = nn.CrossEntropyLoss()(scaled_distances, labels)
+        
+        return loss
+
+class EntityEncoder(nn.Module):
+    """BiLSTM encoder for entity recognition"""
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        # BiLSTM layers
         self.bilstm = nn.LSTM(
             input_size=config.hidden_size,
             hidden_size=config.lstm_hidden_size,
@@ -22,59 +62,71 @@ class EntityEncoder(nn.Module):
             batch_first=True
         )
         
+        # Language-specific adapters
+        self.language_adapters = nn.ModuleDict({
+            lang: nn.Sequential(
+                nn.Linear(config.hidden_size, config.hidden_size),
+                nn.LayerNorm(config.hidden_size),
+                nn.ReLU(),
+                nn.Linear(config.hidden_size, config.hidden_size)
+            )
+            for lang in ['en', 'fr', 'de', 'es', 'it']
+        })
+        
         # Output projection
         self.projection = nn.Linear(
-            2 * config.lstm_hidden_size,  # bidirectional
+            2 * config.lstm_hidden_size,
             config.entity_feature_size
         )
         
         self.dropout = nn.Dropout(config.dropout)
-        
+
     def forward(
         self,
         sequence_output: torch.Tensor,
-        attention_mask: torch.Tensor
+        attention_mask: torch.Tensor,
+        language_ids: torch.Tensor
     ) -> torch.Tensor:
         """
-        Encode input sequences
+        Encode sequences with language-specific processing
         
         Args:
-            sequence_output: Tensor from transformer [batch_size, seq_len, hidden_size]
+            sequence_output: XLM-R outputs [batch_size, seq_len, hidden_size]
             attention_mask: Attention mask [batch_size, seq_len]
-        Returns:
-            Encoded sequences [batch_size, seq_len, entity_feature_size]
+            language_ids: Language identifiers [batch_size]
         """
-        # Apply dropout to inputs
-        sequence_output = self.dropout(sequence_output)
+        batch_size = sequence_output.size(0)
         
-        # Pack padded sequence
-        lengths = attention_mask.sum(dim=1)
-        packed_input = nn.utils.rnn.pack_padded_sequence(
-            sequence_output,
-            lengths.cpu(),
+        # Apply language-specific adapters
+        adapted_outputs = torch.zeros_like(sequence_output)
+        for lang_id, adapter in enumerate(self.language_adapters.values()):
+            lang_mask = (language_ids == lang_id).view(-1, 1, 1)
+            adapted_outputs += lang_mask * adapter(sequence_output)
+        
+        # Pack sequences
+        lengths = attention_mask.sum(dim=1).cpu()
+        packed_input = pack_padded_sequence(
+            adapted_outputs,
+            lengths,
             batch_first=True,
             enforce_sorted=False
         )
         
-        # BiLSTM
+        # BiLSTM processing
         packed_output, _ = self.bilstm(packed_input)
-        
-        # Unpack sequence
-        lstm_output, _ = nn.utils.rnn.pad_packed_sequence(
+        lstm_output, _ = pad_packed_sequence(
             packed_output,
             batch_first=True,
             padding_value=0
         )
         
-        # Project to feature size
+        # Project to final feature space
         entity_features = self.projection(lstm_output)
         
         return entity_features
 
 class EntityBranch(nn.Module):
-    """
-    Named Entity Recognition branch with prototypical networks and CRF
-    """
+    """Named Entity Recognition branch with prototype learning"""
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -83,18 +135,7 @@ class EntityBranch(nn.Module):
         self.encoder = EntityEncoder(config)
         
         # Prototype network
-        self.prototype_network = nn.Sequential(
-            nn.Linear(config.entity_feature_size, config.prototype_dim),
-            nn.ReLU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.prototype_dim, config.prototype_dim)
-        )
-        
-        # Entity classifier
-        self.entity_classifier = nn.Linear(
-            config.prototype_dim,
-            config.num_entity_labels
-        )
+        self.prototype_network = EntityPrototypeNetwork(config)
         
         # CRF layer
         self.crf = CRF(
@@ -102,97 +143,54 @@ class EntityBranch(nn.Module):
             batch_first=True
         )
         
-        # Loss weights for different entity types
-        self.register_buffer(
-            'label_weights',
-            torch.tensor(config.label_weights)
-            if hasattr(config, 'label_weights')
-            else torch.ones(config.num_entity_labels)
-        )
+        # Loss weights based on WikiNEuRal dataset statistics
+        label_weights = self._compute_label_weights()
+        self.register_buffer('label_weights', label_weights)
+    
+    def _compute_label_weights(self) -> torch.Tensor:
+        """Compute label weights based on WikiNEuRal statistics"""
+        # Statistics from WikiNEuRal paper
+        label_counts = {
+            'O': 2.40e6,      # Other
+            'PER': 51000,     # Person
+            'ORG': 31000,     # Organization
+            'LOC': 67000,     # Location
+            'MISC': 45000     # Miscellaneous
+        }
         
-    def compute_prototypes(
-        self,
-        support_features: torch.Tensor,
-        support_labels: torch.Tensor,
-        attention_mask: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute entity prototypes from support set
+        # Convert to weights (inverse frequency)
+        total = sum(label_counts.values())
+        weights = torch.tensor([
+            total / count for label, count in label_counts.items()
+        ])
         
-        Args:
-            support_features: Encoded features from support set
-            support_labels: Entity labels for support set
-            attention_mask: Attention mask for valid tokens
-        Returns:
-            Tensor of entity prototypes
-        """
-        prototypes = []
+        # Normalize weights
+        weights = weights / weights.sum()
         
-        for label_id in range(self.config.num_entity_labels):
-            # Create mask for this entity type
-            label_mask = (support_labels == label_id) & attention_mask
-            
-            if label_mask.sum() > 0:
-                # Get features for this entity type
-                label_features = support_features[label_mask]
-                prototype = label_features.mean(dim=0)
-                prototypes.append(prototype)
-            else:
-                # Create zero prototype if no examples
-                prototypes.append(
-                    torch.zeros(self.config.prototype_dim, device=support_features.device)
-                )
-                
-        return torch.stack(prototypes)
-
-    def compute_distances(
-        self,
-        features: torch.Tensor,
-        prototypes: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute distances between features and prototypes
-        
-        Args:
-            features: Entity features [batch_size, seq_len, prototype_dim]
-            prototypes: Entity prototypes [num_labels, prototype_dim]
-        Returns:
-            Distance matrix [batch_size, seq_len, num_labels]
-        """
-        # Reshape features for distance computation
-        batch_size, seq_len, _ = features.shape
-        features_flat = features.view(-1, self.config.prototype_dim)
-        
-        # Compute distances
-        distances = torch.cdist(features_flat, prototypes)
-        
-        # Reshape back to sequence form
-        distances = distances.view(batch_size, seq_len, -1)
-        
-        return distances
+        return weights
 
     def forward(
         self,
         sequence_output: torch.Tensor,
         attention_mask: torch.Tensor,
+        language_ids: torch.Tensor,
         support_set: Optional[Dict] = None,
         labels: Optional[torch.Tensor] = None
     ) -> Dict:
         """
-        Forward pass through entity branch
+        Forward pass for entity recognition
         
         Args:
-            sequence_output: Transformer outputs
+            sequence_output: XLM-R outputs
             attention_mask: Attention mask
-            support_set: Optional support set for few-shot learning
-            labels: Optional labels for training
-        Returns:
-            Dictionary containing outputs and loss
+            language_ids: Language identifiers
+            support_set: Support set for few-shot learning
+            labels: Entity labels for training
         """
         # Encode sequences
-        entity_features = self.encoder(sequence_output, attention_mask)
+        entity_features = self.encoder(sequence_output, attention_mask, language_ids)
         
-        # Get prototype features
+        # Project to prototype space
         prototype_features = self.prototype_network(entity_features)
         
         outputs = {
@@ -200,61 +198,55 @@ class EntityBranch(nn.Module):
             'prototype_features': prototype_features
         }
         
-        # Few-shot learning with support set
         if support_set is not None:
-            prototypes = self.compute_prototypes(
-                support_set['prototype_features'],
-                support_set['labels'],
-                support_set['attention_mask']
+            # Few-shot learning mode
+            support_features = self.prototype_network(support_set['entity_features'])
+            prototype_loss = self.prototype_network.compute_prototype_loss(
+                support_features,
+                support_set['labels']
             )
+            outputs['prototype_loss'] = prototype_loss
             
-            # Compute distances to prototypes
-            distances = self.compute_distances(prototype_features, prototypes)
-            emissions = -distances  # Negative distances as emissions
+            # Compute distances to support set examples
+            distances = torch.cdist(
+                prototype_features.view(-1, self.config.prototype_dim),
+                support_features.view(-1, self.config.prototype_dim)
+            )
+            emissions = -distances.view(prototype_features.shape[0], -1, self.config.num_entity_labels)
         else:
-            # Regular classification
-            emissions = self.entity_classifier(prototype_features)
+            # Regular sequence labeling mode
+            emissions = self.crf.get_emission_score(prototype_features)
         
         outputs['emissions'] = emissions
         
         # CRF decoding
         if labels is not None:
-            # Compute CRF loss
             mask = attention_mask.bool()
-            loss = -self.crf(emissions, labels, mask=mask, reduction='mean')
-            outputs['loss'] = loss
+            crf_loss = -self.crf(emissions, labels, mask=mask, reduction='mean')
+            outputs['crf_loss'] = crf_loss
+            
+            # Combine losses
+            outputs['loss'] = crf_loss
+            if 'prototype_loss' in outputs:
+                outputs['loss'] += self.config.prototype_loss_weight * outputs['prototype_loss']
         else:
             # Decode best path
             predictions = self.crf.decode(emissions, mask=attention_mask.bool())
             outputs['predictions'] = predictions
-            
+        
         return outputs
-    
-    def compute_loss(
+
+    def compute_similarity_matrix(
         self,
-        outputs: Dict,
-        labels: torch.Tensor,
-        attention_mask: torch.Tensor
+        query_features: torch.Tensor,
+        support_features: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Compute loss with label weights
+        """Compute similarity matrix between query and support features"""
+        query_features = self.prototype_network(query_features)
+        support_features = self.prototype_network(support_features)
         
-        Args:
-            outputs: Forward pass outputs
-            labels: Entity labels
-            attention_mask: Attention mask
-        Returns:
-            Weighted loss
-        """
-        emissions = outputs['emissions']
-        mask = attention_mask.bool()
+        similarities = torch.matmul(
+            query_features, support_features.transpose(-2, -1)
+        )
         
-        # Basic CRF loss
-        crf_loss = -self.crf(emissions, labels, mask=mask, reduction='none')
-        
-        # Apply label weights
-        label_weights = self.label_weights[labels]
-        weighted_loss = crf_loss * label_weights
-        
-        # Average over non-padded tokens
-        return weighted_loss.sum() / mask.sum()
+        return similarities / np.sqrt(self.config.prototype_dim)

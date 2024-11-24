@@ -8,85 +8,98 @@ import logging
 import os
 from tqdm import tqdm
 import wandb
+from pathlib import Path
+import numpy as np
 
-from .episode_builder import EpisodeBuilder
-from .metrics import FewTopNERMetrics
+logger = logging.getLogger(__name__)
 
 class FewTopNERTrainer:
-    """
-    Trainer for FewTopNER model
-    """
+    """Enhanced trainer for multilingual FewTopNER"""
+    
     def __init__(
         self,
         model: nn.Module,
         config,
-        train_dataset,
-        val_dataset,
-        test_dataset=None
+        train_dataloaders: Dict[str, DataLoader],
+        val_dataloaders: Dict[str, DataLoader],
+        test_dataloaders: Optional[Dict[str, DataLoader]] = None,
+        episode_loader = None
     ):
         self.model = model
         self.config = config
-        self.train_dataset = train_dataset
-        self.val_dataset = val_dataset
-        self.test_dataset = test_dataset
+        self.train_dataloaders = train_dataloaders
+        self.val_dataloaders = val_dataloaders
+        self.test_dataloaders = test_dataloaders
+        self.episode_loader = episode_loader
         
-        self.logger = logging.getLogger(__name__)
+        # Setup device
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model.to(self.device)
         
-        # Initialize optimizer and scheduler
+        # Initialize optimizer with layer-wise learning rates
         self.optimizer = self._create_optimizer()
         self.scheduler = self._create_scheduler()
-        
-        # Initialize episode builder and metrics
-        self.episode_builder = EpisodeBuilder(config)
-        self.metrics = FewTopNERMetrics(config)
         
         # Training state
         self.current_epoch = 0
         self.global_step = 0
-        self.best_metric = float('-inf')
+        self.best_metrics = {
+            'entity_f1': float('-inf'),
+            'topic_accuracy': float('-inf'),
+            'combined_score': float('-inf')
+        }
         
     def _create_optimizer(self):
-        """Initialize optimizer with weight decay"""
-        no_decay = ['bias', 'LayerNorm.weight']
-        optimizer_grouped_parameters = [
+        """Create optimizer with layer-wise learning rates"""
+        # Collect parameters with different learning rates
+        optimizer_groups = [
             {
-                'params': [p for n, p in self.model.named_parameters()
-                          if not any(nd in n for nd in no_decay)],
-                'weight_decay': self.config.weight_decay
+                'params': self.model.shared_encoder.parameters(),
+                'lr': self.config.encoder_lr
             },
             {
-                'params': [p for n, p in self.model.named_parameters()
-                          if any(nd in n for nd in no_decay)],
-                'weight_decay': 0.0
+                'params': self.model.entity_branch.parameters(),
+                'lr': self.config.task_lr
+            },
+            {
+                'params': self.model.topic_branch.parameters(),
+                'lr': self.config.task_lr
+            },
+            {
+                'params': self.model.bridge.parameters(),
+                'lr': self.config.bridge_lr
             }
         ]
         
         return AdamW(
-            optimizer_grouped_parameters,
-            lr=self.config.learning_rate,
+            optimizer_groups,
+            weight_decay=self.config.weight_decay,
             eps=self.config.adam_epsilon
         )
-        
+
     def _create_scheduler(self):
-        """Initialize learning rate scheduler"""
-        num_training_steps = self.config.num_epochs * len(self.train_dataset)
-        num_warmup_steps = int(num_training_steps * self.config.warmup_ratio)
+        """Create learning rate scheduler with warmup"""
+        total_steps = (
+            self.config.num_epochs * 
+            self.config.episodes_per_epoch * 
+            len(self.train_dataloaders)
+        )
+        
+        warmup_steps = int(total_steps * self.config.warmup_ratio)
         
         return get_linear_schedule_with_warmup(
             self.optimizer,
-            num_warmup_steps=num_warmup_steps,
-            num_training_steps=num_training_steps
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps
         )
-        
+
     def train(self):
-        """Main training loop"""
-        self.logger.info("Starting training...")
+        """Main training loop with episode-based few-shot learning"""
+        logger.info("Starting training...")
         
         for epoch in range(self.config.num_epochs):
             self.current_epoch = epoch
-            self.logger.info(f"\nEpoch {epoch+1}/{self.config.num_epochs}")
+            logger.info(f"\nEpoch {epoch + 1}/{self.config.num_epochs}")
             
             # Training phase
             train_metrics = self._train_epoch()
@@ -95,51 +108,67 @@ class FewTopNERTrainer:
             val_metrics = self._validate()
             
             # Log metrics
-            self._log_metrics(train_metrics, val_metrics)
+            self._log_metrics(
+                {'train': train_metrics},
+                {'validation': val_metrics}
+            )
             
             # Save checkpoint if improved
             if self._is_improved(val_metrics):
                 self._save_checkpoint()
-                
-        # Final test evaluation
-        if self.test_dataset is not None:
-            self._test()
-            
-    def _train_epoch(self) -> Dict[str, float]:
-        """Train for one epoch"""
-        self.model.train()
-        self.metrics.reset()
         
-        # Create episodes for few-shot learning
-        episodes = self.episode_builder.create_episodes(
-            self.train_dataset,
-            self.config.episodes_per_epoch
+        # Final test evaluation
+        if self.test_dataloaders:
+            test_metrics = self._test()
+            self._log_metrics({'test': test_metrics})
+
+    def _train_epoch(self) -> Dict[str, float]:
+        """Train for one epoch with few-shot episodes"""
+        self.model.train()
+        epoch_stats = {
+            'loss': 0.0,
+            'entity_loss': 0.0,
+            'topic_loss': 0.0,
+            'bridge_loss': 0.0,
+            'contrastive_loss': 0.0
+        }
+        
+        num_batches = 0
+        progress_bar = tqdm(
+            self.episode_loader,
+            desc=f"Training epoch {self.current_epoch + 1}"
         )
         
-        progress_bar = tqdm(episodes, desc="Training")
-        for support_set, query_set in progress_bar:
-            # Move data to device
-            support_set = self._to_device(support_set)
-            query_set = self._to_device(query_set)
+        for batch, support_loader, query_loader in progress_bar:
+            # Process support set
+            support_loss = 0
+            for support_batch in support_loader:
+                support_batch = self._to_device(support_batch)
+                support_outputs = self.model(
+                    **support_batch,
+                    support_set=None
+                )
+                support_loss += support_outputs['losses']['total']
             
-            # Inner loop (support set)
+            # Process query set
+            query_loss = 0
+            for query_batch in query_loader:
+                query_batch = self._to_device(query_batch)
+                query_outputs = self.model(
+                    **query_batch,
+                    support_set=support_batch
+                )
+                query_loss += query_outputs['losses']['total']
+            
+            # Compute total loss
+            total_loss = (support_loss / len(support_loader) + 
+                         query_loss / len(query_loader)) / 2
+            
+            # Backward pass
             self.optimizer.zero_grad()
-            support_outputs = self.model(
-                **support_set,
-                support_set=None  # No support set for support set training
-            )
-            support_loss = support_outputs['loss']
-            support_loss.backward()
+            total_loss.backward()
             
-            # Outer loop (query set)
-            query_outputs = self.model(
-                **query_set,
-                support_set=support_set
-            )
-            query_loss = query_outputs['loss']
-            query_loss.backward()
-            
-            # Update model
+            # Gradient clipping
             if self.config.max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
@@ -149,193 +178,153 @@ class FewTopNERTrainer:
             self.optimizer.step()
             self.scheduler.step()
             
-            # Update metrics
-            self._update_metrics(
-                support_outputs,
-                query_outputs,
-                support_set,
-                query_set
+            # Update statistics
+            epoch_stats['loss'] += total_loss.item()
+            epoch_stats['entity_loss'] += (
+                query_outputs['losses']['entity'].item()
             )
+            epoch_stats['topic_loss'] += (
+                query_outputs['losses']['topic'].item()
+            )
+            epoch_stats['bridge_loss'] += (
+                query_outputs['losses']['bridge'].item()
+            )
+            epoch_stats['contrastive_loss'] += (
+                query_outputs['losses']['contrastive'].item()
+            )
+            
+            num_batches += 1
+            self.global_step += 1
             
             # Update progress bar
             progress_bar.set_postfix({
-                'support_loss': support_loss.item(),
-                'query_loss': query_loss.item()
+                'loss': total_loss.item(),
+                'lr': self.scheduler.get_last_lr()[0]
             })
-            
-            self.global_step += 1
-            
-        return self.metrics.get_all_metrics()
         
+        # Compute averages
+        for key in epoch_stats:
+            epoch_stats[key] /= num_batches
+        
+        return epoch_stats
+
     def _validate(self) -> Dict[str, float]:
-        """Validation phase"""
+        """Validation across all languages"""
         self.model.eval()
-        self.metrics.reset()
-        
-        # Create validation episodes
-        episodes = self.episode_builder.create_episodes(
-            self.val_dataset,
-            self.config.val_episodes
-        )
+        metrics = {lang: {} for lang in self.val_dataloaders.keys()}
         
         with torch.no_grad():
-            for support_set, query_set in tqdm(episodes, desc="Validation"):
-                support_set = self._to_device(support_set)
-                query_set = self._to_device(query_set)
-                
-                # Get predictions
-                query_outputs = self.model(
-                    **query_set,
-                    support_set=support_set
+            for lang, dataloader in self.val_dataloaders.items():
+                lang_metrics = self._evaluate_language(
+                    dataloader,
+                    lang,
+                    "Validation"
                 )
-                
-                # Update metrics
-                self._update_metrics(
-                    None,  # No support set metrics during validation
-                    query_outputs,
-                    None,
-                    query_set
-                )
-                
-        return self.metrics.get_all_metrics()
+                metrics[lang] = lang_metrics
         
-    def _test(self) -> Dict[str, float]:
-        """Test phase"""
-        self.logger.info("\nStarting test evaluation...")
-        self.model.eval()
-        self.metrics.reset()
-        
-        # Create test episodes
-        episodes = self.episode_builder.create_episodes(
-            self.test_dataset,
-            self.config.test_episodes
-        )
-        
-        with torch.no_grad():
-            for support_set, query_set in tqdm(episodes, desc="Testing"):
-                support_set = self._to_device(support_set)
-                query_set = self._to_device(query_set)
-                
-                query_outputs = self.model(
-                    **query_set,
-                    support_set=support_set
-                )
-                
-                self._update_metrics(
-                    None,
-                    query_outputs,
-                    None,
-                    query_set
-                )
-                
-        # Log final test metrics
-        test_metrics = self.metrics.get_all_metrics()
-        self.logger.info("\nTest Results:")
-        self._log_metrics({'test': test_metrics})
-        
-        return test_metrics
-        
-    def _update_metrics(
+        # Compute average metrics across languages
+        avg_metrics = self._average_metrics(metrics)
+        return {**metrics, 'average': avg_metrics}
+
+    def _evaluate_language(
         self,
-        support_outputs: Optional[Dict],
-        query_outputs: Dict,
-        support_set: Optional[Dict],
-        query_set: Dict
-    ):
-        """Update metrics with batch outputs"""
-        # Update NER metrics
-        if query_outputs.get('entity_predictions') is not None:
-            self.metrics.update_ner_metrics(
-                predictions=query_outputs['entity_predictions'],
-                targets=query_set['entity_labels'],
-                language=query_set['language'][0]
-            )
-            
-        # Update topic metrics
-        if query_outputs.get('topic_predictions') is not None:
-            self.metrics.update_topic_metrics(
-                predictions=query_outputs['topic_predictions'],
-                targets=query_set['topic_labels'],
-                features=query_outputs['topic_features'],
-                language=query_set['language'][0]
-            )
-            
-        # Update episode metrics
-        if support_outputs is not None:
-            self.metrics.update_episode_metrics(
-                support_accuracy=self._compute_accuracy(
-                    support_outputs, support_set
-                ),
-                query_accuracy=self._compute_accuracy(
-                    query_outputs, query_set
-                ),
-                adaptation_steps=1
-            )
-            
-    def _compute_accuracy(
-        self,
-        outputs: Dict,
-        batch: Dict
-    ) -> float:
-        """Compute accuracy for a batch"""
-        entity_correct = (
-            outputs['entity_predictions'] == 
-            batch['entity_labels']
-        ).float().mean()
+        dataloader: DataLoader,
+        language: str,
+        phase: str
+    ) -> Dict[str, float]:
+        """Evaluate model on a specific language"""
+        metrics = {
+            'entity_f1': 0.0,
+            'topic_accuracy': 0.0,
+            'loss': 0.0
+        }
         
-        topic_correct = (
-            outputs['topic_predictions'] == 
-            batch['topic_labels']
-        ).float().mean()
+        num_batches = 0
+        for batch in tqdm(dataloader, desc=f"{phase} - {language}"):
+            batch = self._to_device(batch)
+            outputs = self.model(**batch)
+            
+            # Update metrics
+            metrics['entity_f1'] += self._compute_f1(
+                outputs['entity_outputs']['predictions'],
+                batch['entity_labels']
+            )
+            metrics['topic_accuracy'] += self._compute_accuracy(
+                outputs['topic_outputs']['predictions'],
+                batch['topic_labels']
+            )
+            if 'losses' in outputs:
+                metrics['loss'] += outputs['losses']['total'].item()
+            
+            num_batches += 1
         
-        return (entity_correct + topic_correct) / 2
+        # Compute averages
+        for key in metrics:
+            metrics[key] /= num_batches
         
+        return metrics
+
     def _is_improved(self, metrics: Dict) -> bool:
-        """Check if model improved"""
-        current_metric = metrics['few_shot']['mean_query_accuracy']
-        if current_metric > self.best_metric:
-            self.best_metric = current_metric
+        """Check if model performance improved"""
+        avg_metrics = metrics['average']
+        combined_score = (
+            avg_metrics['entity_f1'] + 
+            avg_metrics['topic_accuracy']
+        ) / 2
+        
+        if combined_score > self.best_metrics['combined_score']:
+            self.best_metrics.update({
+                'entity_f1': avg_metrics['entity_f1'],
+                'topic_accuracy': avg_metrics['topic_accuracy'],
+                'combined_score': combined_score
+            })
             return True
         return False
-        
+
     def _save_checkpoint(self):
         """Save model checkpoint"""
         checkpoint = {
+            'epoch': self.current_epoch,
+            'global_step': self.global_step,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
-            'epoch': self.current_epoch,
-            'global_step': self.global_step,
-            'best_metric': self.best_metric,
+            'best_metrics': self.best_metrics,
             'config': self.config
         }
         
-        checkpoint_path = os.path.join(
-            self.config.output_dir,
-            f'checkpoint-{self.current_epoch}.pt'
-        )
+        save_path = Path(self.config.output_dir) / 'checkpoints'
+        save_path.mkdir(parents=True, exist_ok=True)
         
+        checkpoint_path = save_path / f'checkpoint-epoch{self.current_epoch}.pt'
         torch.save(checkpoint, checkpoint_path)
-        self.logger.info(f"Saved checkpoint: {checkpoint_path}")
         
+        # Save best model separately
+        if self._is_improved(self.best_metrics):
+            best_path = save_path / 'best_model.pt'
+            torch.save(checkpoint, best_path)
+            logger.info(f"Saved new best model: {best_path}")
+
+    def _to_device(self, batch: Dict) -> Dict:
+        """Move batch to device"""
+        return {
+            k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+            for k, v in batch.items()
+        }
+
     def _log_metrics(self, *metric_dicts):
         """Log metrics to console and wandb"""
         for metrics in metric_dicts:
             for category, values in metrics.items():
-                self.logger.info(f"\n{category} metrics:")
-                for name, value in values.items():
-                    self.logger.info(f"{name}: {value:.4f}")
-                    
-                    if wandb.run is not None:
-                        wandb.log({
-                            f"{category}/{name}": value,
-                            'epoch': self.current_epoch,
-                            'global_step': self.global_step
-                        })
+                logger.info(f"\n{category.upper()} METRICS:")
+                for lang, lang_metrics in values.items():
+                    logger.info(f"\n{lang}:")
+                    for name, value in lang_metrics.items():
+                        logger.info(f"{name}: {value:.4f}")
                         
-    def _to_device(self, batch: Dict) -> Dict:
-        """Move batch to device"""
-        return {
-            k: v.to(self.device) if torch.is_tensor(v) else v
-            for k, v in batch.items()
-        }
+                        if wandb.run is not None:
+                            wandb.log({
+                                f"{category}/{lang}/{name}": value,
+                                'epoch': self.current_epoch,
+                                'global_step': self.global_step
+                            })
