@@ -197,6 +197,7 @@ def log_metrics(metrics: Dict):
     if wandb.run:
         wandb.log(metrics)
 
+
 def main():
     """Main execution pipeline"""
     # Parse arguments
@@ -207,7 +208,7 @@ def main():
     
     # Load configuration
     config = FewTopNERConfig.from_file(args.config)
-    
+
     # Setup environment
     device = setup_environment(config)
     

@@ -13,17 +13,15 @@ class EpisodeBuilder:
     
     def __init__(self, config):
         self.config = config
-        
-        # Episode settings
-        self.n_way = config.n_way
-        self.k_shot = config.k_shot
-        self.n_query = config.n_query
-        self.min_examples = config.min_examples_per_class
-        self.batch_size = config.batch_size
+        # Access settings through data config
+        self.n_way = config.data.n_way
+        self.k_shot = config.data.k_shot
+        self.n_query = config.data.n_query
+        self.min_examples_per_class = config.data.min_examples_per_class
+        self.num_languages_per_episode = config.data.num_languages_per_episode  # Fix: access through data config
         
         # Language settings
-        self.languages = ['en', 'fr', 'de', 'es', 'it']
-        self.num_languages_per_episode = config.num_languages_per_episode
+        self.languages = config.model.languages  # Use languages from model config
         
         # NER label mapping from WikiNEuRal
         self.ner_labels = {
@@ -47,9 +45,10 @@ class EpisodeBuilder:
             Tuple of (support_loader, query_loader)
         """
         # Select languages for this episode
+        available_languages = [lang for lang in self.languages if lang in datasets]
         episode_langs = random.sample(
-            self.languages,
-            min(self.num_languages_per_episode, len(self.languages))
+            available_languages,
+            min(self.num_languages_per_episode, len(available_languages))
         )
         
         # Collect examples for support and query sets
@@ -68,16 +67,20 @@ class EpisodeBuilder:
         # Create loaders
         support_loader = DataLoader(
             support_examples,
-            batch_size=self.config.support_batch_size,
+            batch_size=self.config.data.support_batch_size,  # Fix: access through data config
             shuffle=True,
-            collate_fn=self._collate_fn
+            collate_fn=self._collate_fn,
+            num_workers=self.config.data.num_workers,  # Add num_workers
+            pin_memory=self.config.data.pin_memory    # Add pin_memory
         )
         
         query_loader = DataLoader(
             query_examples,
-            batch_size=self.config.query_batch_size,
+            batch_size=self.config.data.query_batch_size,  # Fix: access through data config
             shuffle=True,
-            collate_fn=self._collate_fn
+            collate_fn=self._collate_fn,
+            num_workers=self.config.data.num_workers,  # Add num_workers
+            pin_memory=self.config.data.pin_memory    # Add pin_memory
         )
         
         return support_loader, query_loader

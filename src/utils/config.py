@@ -6,10 +6,10 @@ import yaml
 
 @dataclass
 class ModelConfig:
-    """Base configuration for FewTopNER model architecture"""
-    # XLM-RoBERTa parameters
+    """Base configuration for model architecture"""
+    # Model parameters
     model_name: str = "xlm-roberta-base"
-    hidden_size: int = 768
+    hidden_size: int = 768  # XLM-RoBERTa hidden size
     dropout: float = 0.1
     max_length: int = 512
     
@@ -20,42 +20,47 @@ class ModelConfig:
     prototype_dim: int = 128
     contrastive_dim: int = 128
     
+    # Task-specific parameters
+    num_entity_labels: int = 9  # Including 'O' tag
+    num_topics: int = 100
+    
+    # Transformer settings
+    num_attention_heads: int = 8
+    intermediate_size: int = 3072
+    hidden_act: str = "gelu"
+    attention_dropout: float = 0.1
+    
     # Language settings
     languages: List[str] = field(default_factory=lambda: ['en', 'fr', 'de', 'es', 'it'])
     language_adapters: bool = True
     
-    # Task-specific dimensions
-    num_entity_labels: int = 9  # From WikiNEuRal (O, B/I-PER, B/I-ORG, B/I-LOC, B/I-MISC)
-    num_topics: int = 100       # Number of Wikipedia topics to model
+    # Cross-lingual settings
+    use_language_embeddings: bool = True
+    language_embedding_dim: int = 32
+    cross_lingual_sharing: bool = True
     
+    # Other architecture settings
+    use_crf: bool = True
+    use_language_adapters: bool = True
+    shared_encoder_layers: int = 12
+    task_specific_layers: int = 2
+
     def to_dict(self) -> Dict:
+        """Convert config to dictionary"""
         return {k: v for k, v in self.__dict__.items()}
 
 @dataclass
 class PreprocessingConfig:
-    """Configuration for data preprocessing"""
-    # WikiNEuRal settings
+    """Data preprocessing configuration"""
     wikineural_path: str = "data/ner/wikineural"
-    max_ner_length: int = 128
-    ner_stride: int = 32
-    
-    # Wikipedia settings
-    wikipedia_path: str = "data/topic/wikipedia"
+    wikipedia_base_path: str = "data/topic/wikipedia"  # Added this
     wiki_dump_date: str = "20231101"
+    max_ner_length: int = 128
     min_text_length: int = 100
     max_text_length: int = 1000
-    
-    # Token settings
     min_word_freq: int = 5
     max_word_freq: float = 0.7
     max_vocab_size: int = 50000
-    
-    # Topic modeling
-    min_df: int = 5
-    max_df: float = 0.7
-    num_topics: int = 100
-    
-    # Caching
     cache_dir: str = "cache"
     use_cache: bool = True
 

@@ -51,7 +51,192 @@ class WikiNeuRalDataset(Dataset):
             'language_id': torch.tensor(feature.language_id, dtype=torch.long)
         }
 
-class WikiNeurxalProcessor:
+class WikiNeuralProcessor:
+    """Processor for WikiNEuRal NER dataset"""
+    
+    def __init__(self, config):
+        self.config = config
+        self.languages = config.model.languages
+        self.label_map = {
+            'O': 0,
+            'B-PER': 1, 'I-PER': 2,
+            'B-ORG': 3, 'I-ORG': 4,
+            'B-LOC': 5, 'I-LOC': 6,
+            'B-MISC': 7, 'I-MISC': 8
+        }
+
+    def process_all_languages(self) -> Dict[str, Dict[str, List]]:
+        """
+        Process WikiNEuRal data for all languages
+        
+        Returns:
+            Dictionary of processed data by language and split
+        """
+        datasets = {}
+        
+        for lang in self.languages:
+            logger.info(f"Processing WikiNEuRal data for {lang}")
+            try:
+                lang_datasets = self.process_language(lang)
+                if lang_datasets:
+                    datasets[lang] = lang_datasets
+            except Exception as e:
+                logger.error(f"Error processing language {lang}: {e}")
+                continue
+        
+        return datasets
+
+    def process_language(self, language: str) -> Dict[str, List]:
+        """Process data for a specific language"""
+        processed_data = {}
+        base_path = Path(self.config.preprocessing.wikineural_path) / language
+        
+        for split in ['train', 'dev', 'test']:
+            file_path = base_path / f"{split}.conll"
+            if not file_path.exists():
+                logger.warning(f"File not found: {file_path}")
+                continue
+                
+            try:
+                examples = self.read_conll_file(file_path, language)
+                processed_data[split] = examples
+                logger.info(f"Processed {len(examples)} examples for {language} {split}")
+            except Exception as e:
+                logger.error(f"Error processing {file_path}: {e}")
+                continue
+        
+        return processed_data if processed_data else None
+
+    def read_conll_file(self, file_path: Path, language: str) -> List[Dict]:
+        """Read and process CoNLL format file"""
+        examples = []
+        current_words = []
+        current_labels = []
+        
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                
+                if line.startswith('-DOCSTART-') or not line:
+                    if current_words:
+                        example = self.create_example(
+                            current_words,
+                            current_labels,
+                            language
+                        )
+                        if example:
+                            examples.append(example)
+                        current_words = []
+                        current_labels = []
+                    continue
+                
+                parts = line.split()
+                if len(parts) >= 2:
+                    current_words.append(parts[0])
+                    current_labels.append(parts[-1])
+            
+            # Handle last example
+            if current_words:
+                example = self.create_example(
+                    current_words,
+                    current_labels,
+                    language
+                )
+                if example:
+                    examples.append(example)
+        
+        return examples
+
+    def create_example(
+        self,
+        words: List[str],
+        labels: List[str],
+        language: str
+    ) -> Optional[Dict]:
+        """Create a single example from words and labels"""
+        try:
+            # Convert labels to IDs
+            label_ids = [self.label_map.get(label, self.label_map['O']) 
+                        for label in labels]
+            
+            return {
+                'words': words,
+                'labels': labels,
+                'label_ids': label_ids,
+                'language': language,
+                'length': len(words)
+            }
+        except Exception as e:
+            logger.error(f"Error creating example: {e}")
+            return None
+
+    def get_statistics(self, datasets: Dict[str, Dict[str, List]]) -> Dict:
+        """Compute dataset statistics"""
+        stats = {}
+        
+        for lang, lang_data in datasets.items():
+            lang_stats = {
+                'total_examples': 0,
+                'total_tokens': 0,
+                'entity_counts': defaultdict(int)
+            }
+            
+            for split, examples in lang_data.items():
+                split_stats = self.compute_split_statistics(examples)
+                lang_stats['total_examples'] += split_stats['num_examples']
+                lang_stats['total_tokens'] += split_stats['num_tokens']
+                
+                for entity_type, count in split_stats['entity_counts'].items():
+                    lang_stats['entity_counts'][entity_type] += count
+            
+            stats[lang] = lang_stats
+        
+        return stats
+
+    def compute_split_statistics(self, examples: List[Dict]) -> Dict:
+        """Compute statistics for a data split"""
+        stats = {
+            'num_examples': len(examples),
+            'num_tokens': sum(ex['length'] for ex in examples),
+            'entity_counts': defaultdict(int)
+        }
+        
+        for example in examples:
+            for label in example['labels']:
+                if label != 'O':
+                    entity_type = label[2:]  # Remove B- or I- prefix
+                    stats['entity_counts'][entity_type] += 1
+        
+        return stats
+
+    def verify_data(self, datasets: Dict[str, Dict[str, List]]) -> bool:
+        """Verify processed data"""
+        try:
+            for lang, lang_data in datasets.items():
+                for split, examples in lang_data.items():
+                    # Check for non-empty examples
+                    if not examples:
+                        logger.error(f"No examples found for {lang} {split}")
+                        return False
+                    
+                    # Verify example format
+                    for ex in examples:
+                        if not all(k in ex for k in ['words', 'labels', 'label_ids', 'language']):
+                            logger.error(f"Invalid example format in {lang} {split}")
+                            return False
+                        
+                        # Verify label consistency
+                        if len(ex['words']) != len(ex['labels']):
+                            logger.error(f"Mismatched words and labels in {lang} {split}")
+                            return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error verifying data: {e}")
+            return False
+
+class WikiNeuralProcessor1:
     """Processor for WikiNEuRal dataset following the official specifications"""
     
     # Official label mapping from the dataset
