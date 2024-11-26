@@ -1,69 +1,214 @@
+import os
 import torch
 import random
 import numpy as np
 from typing import Dict, List, Tuple, Optional, Set
 from collections import defaultdict
-import nltk
-from nltk.corpus import wordnet
-from copy import deepcopy
-import spacy
-from transformers import MarianMTTokenizer, MarianMTModel
+import logging
+try:
+    import fasttext
+    FASTTEXT_AVAILABLE = True
+except ImportError:
+    FASTTEXT_AVAILABLE = False
+    print("Warning: fasttext not installed. Language detection will be disabled.")
+
+try:
+    import spacy
+    SPACY_AVAILABLE = True
+except ImportError:
+    SPACY_AVAILABLE = False
+    print("Warning: spacy not installed. Some features will be disabled.")
+
+try:
+    from transformers import MarianTokenizer, MarianMTModel
+    MARIAN_AVAILABLE = True
+except ImportError:
+    MARIAN_AVAILABLE = False
+    print("Warning: transformers not installed. Translation features will be disabled.")
+
+try:
+    from sacremoses import MosesTokenizer, MosesDetokenizer
+    MOSES_AVAILABLE = True
+except ImportError:
+    MOSES_AVAILABLE = False
+    print("Warning: sacremoses not installed. Some tokenization features will be disabled.")
+
+# Setup logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+class LanguageManager:
+    """Manages language-specific operations and resources"""
+    
+    def __init__(self, config):
+        self.config = config
+        self.lang_detector = None
+        self.nlp_models = {}
+        self.moses_tokenizers = {}
+        self.moses_detokenizers = {}
+        
+        # Initialize language detection
+        if FASTTEXT_AVAILABLE:
+            try:
+                model_path = os.path.join(config.preprocessing.cache_dir, 'lid.176.bin')
+                if os.path.exists(model_path):
+                    self.lang_detector = fasttext.load_model(model_path)
+                else:
+                    logger.warning(f"FastText model not found at {model_path}")
+            except Exception as e:
+                logger.warning(f"Could not load fasttext model: {e}")
+
+        # Initialize spaCy models
+        if SPACY_AVAILABLE:
+            for lang in self.config.model.languages:
+                try:
+                    model_name = self.get_spacy_model_name(lang)
+                    self.nlp_models[lang] = spacy.load(model_name)
+                    logger.info(f"Loaded spaCy model for {lang}")
+                except OSError as e:
+                    logger.warning(f"Could not load spaCy model for {lang}: {e}")
+                    logger.warning(f"Please install it with: python -m spacy download {model_name}")
+
+        # Initialize Moses tokenizers
+        if MOSES_AVAILABLE:
+            for lang in self.config.model.languages:
+                try:
+                    self.moses_tokenizers[lang] = MosesTokenizer(lang=lang)
+                    self.moses_detokenizers[lang] = MosesDetokenizer(lang=lang)
+                except Exception as e:
+                    logger.warning(f"Could not initialize Moses for {lang}: {e}")
+
+    @staticmethod
+    def get_spacy_model_name(language: str) -> str:
+        """Get spaCy model name for language"""
+        model_mapping = {
+            'en': 'en_core_web_sm',
+            'fr': 'fr_core_news_sm',
+            'de': 'de_core_news_sm',
+            'es': 'es_core_news_sm',
+            'it': 'it_core_news_sm'
+        }
+        return model_mapping.get(language, 'en_core_web_sm')
+
+    def detect_language(self, text: str) -> Tuple[str, float]:
+        """Detect language of text"""
+        if self.lang_detector is None:
+            logger.warning("Language detection not available")
+            return 'en', 0.0  # Default to English
+            
+        try:
+            predictions = self.lang_detector.predict(text, k=1)
+            lang_code = predictions[0][0].replace('__label__', '')
+            confidence = predictions[1][0]
+            return lang_code, confidence
+        except Exception as e:
+            logger.error(f"Error in language detection: {e}")
+            return 'en', 0.0
+
+    def tokenize(self, text: str, language: str) -> List[str]:
+        """Tokenize text using appropriate tokenizer"""
+        try:
+            if language in self.moses_tokenizers:
+                return self.moses_tokenizers[language].tokenize(text)
+            if language in self.nlp_models:
+                doc = self.nlp_models[language](text)
+                return [token.text for token in doc]
+            return text.split()
+        except Exception as e:
+            logger.error(f"Error in tokenization: {e}")
+            return text.split()
+
+    def detokenize(self, tokens: List[str], language: str) -> str:
+        """Detokenize text using appropriate detokenizer"""
+        try:
+            if language in self.moses_detokenizers:
+                return self.moses_detokenizers[language].detokenize(tokens)
+            return ' '.join(tokens)
+        except Exception as e:
+            logger.error(f"Error in detokenization: {e}")
+            return ' '.join(tokens)
+
+    def process_text(self, text: str, language: str) -> Dict:
+        """Process text with language-specific tools"""
+        try:
+            if language in self.nlp_models:
+                doc = self.nlp_models[language](text)
+                return {
+                    'tokens': [token.text for token in doc],
+                    'lemmas': [token.lemma_ for token in doc],
+                    'pos': [token.pos_ for token in doc],
+                    'entities': [(ent.text, ent.label_) for ent in doc.ents]
+                }
+            return {
+                'tokens': self.tokenize(text, language),
+                'lemmas': self.tokenize(text, language),
+                'pos': ['NOUN'] * len(self.tokenize(text, language)),
+                'entities': []
+            }
+        except Exception as e:
+            logger.error(f"Error in text processing: {e}")
+            return {'tokens': text.split()}
+
+    def cleanup(self):
+        """Cleanup resources"""
+        self.lang_detector = None
+        self.nlp_models.clear()
+        self.moses_tokenizers.clear()
+        self.moses_detokenizers.clear()
 
 class CrossLingualAugmenter:
-    """Enhanced cross-lingual data augmentation for FewTopNER"""
+    """Cross-lingual data augmentation for FewTopNER"""
     
-    def __init__(self, config, language_manager):
+    def __init__(self, config, language_manager: LanguageManager):
         self.config = config
         self.lang_manager = language_manager
-        
-        # Load translation models for back-translation
-        self.translation_models = self._load_translation_models()
-        
-        # Entity dictionaries for substitution
-        self.entity_dictionaries = self._load_entity_dictionaries()
-        
-        # Cache for word translations
+        self.translation_models = {}
         self.translation_cache = defaultdict(dict)
         
-        # Named entity sets per type and language
-        self.entity_sets = self._initialize_entity_sets()
-    
-    def _load_translation_models(self) -> Dict[str, Tuple[MarianMTModel, MarianMTTokenizer]]:
+        # Initialize translation models if available
+        if MARIAN_AVAILABLE:
+            self.translation_models = self._load_translation_models()
+        else:
+            logger.warning("MarianMT not available. Translation features disabled.")
+
+    def _load_translation_models(self) -> Dict[str, Tuple[MarianMTModel, MarianTokenizer]]:
         """Load translation models for each language pair"""
         models = {}
         language_pairs = [
-            ('en', 'fr'), ('en', 'de'), ('en', 'es'), ('en', 'it'),
-            ('fr', 'en'), ('de', 'en'), ('es', 'en'), ('it', 'en')
+            (src, tgt) for src in self.config.model.languages 
+            for tgt in self.config.model.languages if src != tgt
         ]
         
         for src, tgt in language_pairs:
-            model_name = f'Helsinki-NLP/opus-mt-{src}-{tgt}'
             try:
-                tokenizer = MarianMTTokenizer.from_pretrained(model_name)
+                model_name = f'Helsinki-NLP/opus-mt-{src}-{tgt}'
+                tokenizer = MarianTokenizer.from_pretrained(model_name)
                 model = MarianMTModel.from_pretrained(model_name)
                 models[f'{src}-{tgt}'] = (model, tokenizer)
-            except:
-                continue
-                
+                logger.info(f"Loaded translation model: {src}->{tgt}")
+            except Exception as e:
+                logger.warning(f"Could not load translation model {src}->{tgt}: {e}")
+        
         return models
 
     def _initialize_entity_sets(self) -> Dict[str, Dict[str, Set[str]]]:
-        """Initialize sets of entities for each type and language"""
+        """Initialize entity sets for each language"""
         entity_sets = defaultdict(lambda: defaultdict(set))
         
-        # Load entity lists for each language
-        for lang in self.lang_manager.config.languages:
-            nlp = self.lang_manager.nlp_models.get(lang)
-            if nlp:
-                # Add common entities from spaCy
-                with nlp.select_pipes(enable=['ner']):
-                    for text in self.entity_dictionaries.get(lang, []):
-                        doc = nlp(text)
-                        for ent in doc.ents:
-                            entity_sets[lang][ent.label_].add(ent.text)
+        for lang, nlp in self.lang_manager.nlp_models.items():
+            if nlp is not None:
+                # Extract entities from example texts if available
+                example_texts = self.config.example_texts.get(lang, [])
+                for text in example_texts:
+                    doc = nlp(text)
+                    for ent in doc.ents:
+                        entity_sets[lang][ent.label_].add(ent.text)
         
         return entity_sets
-
+    
     def augment_ner_sample(
         self,
         tokens: List[str],
@@ -271,7 +416,7 @@ class CrossLingualAugmenter:
         self,
         text: str,
         model: MarianMTModel,
-        tokenizer: MarianMTTokenizer
+        tokenizer: MarianTokenizer
     ) -> str:
         """Translate text using MarianMT model"""
         inputs = tokenizer([text], return_tensors="pt", padding=True)
@@ -376,3 +521,8 @@ class CrossLingualAugmenter:
             spans.append((start_idx, len(tokens), current_entity))
         
         return spans
+    
+    def cleanup(self):
+        """Cleanup resources"""
+        self.translation_models.clear()
+        self.translation_cache.clear()
