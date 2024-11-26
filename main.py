@@ -53,6 +53,22 @@ def setup_environment(config):
     
     return device
 
+def setup_language_tools(config):
+    """Setup language processing tools"""
+    try:
+        # Initialize language manager
+        language_manager = LanguageManager(config)
+        
+        # Initialize augmenter
+        augmenter = CrossLingualAugmenter(config, language_manager)
+        
+        return language_manager, augmenter
+        
+    except Exception as e:
+        logger.error(f"Error setting up language tools: {e}")
+        raise
+
+
 def prepare_data(config, language_manager):
     """Prepare datasets and dataloaders"""
     logger.info("Preparing datasets...")
@@ -196,7 +212,7 @@ def main():
     device = setup_environment(config)
     
     # Initialize language manager
-    language_manager = LanguageManager(config)
+    language_manager, augmenter = setup_language_tools(config)
     
     try:
         # Prepare data
@@ -233,9 +249,10 @@ def main():
     
     finally:
         # Cleanup
-        if wandb.run:
-            wandb.finish()
-        logger.info("Finished execution")
+        if 'language_manager' in locals():
+            language_manager.cleanup()
+        if 'augmenter' in locals():
+            augmenter.cleanup()
 
 if __name__ == '__main__':
     main()
