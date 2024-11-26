@@ -132,6 +132,11 @@ class TrainingConfig:
     evaluation_strategy: str = "epoch"
     log_level: str = "info"
 
+    use_wandb: bool = True
+    wandb_project: str = "FewTopNER"
+    wandb_entity: Optional[str] = None
+    wandb_group: Optional[str] = None
+
 @dataclass
 class BridgeConfig:
     """Configuration for cross-task bridge module"""
@@ -148,6 +153,19 @@ class BridgeConfig:
     # Loss weights
     alignment_weight: float = 0.1
     consistency_weight: float = 0.1
+
+@dataclass
+class AugmentationConfig:
+    """Data augmentation configuration"""
+    entity_aug_prob: float = 0.3
+    context_aug_prob: float = 0.3
+    translation_aug_prob: float = 0.2
+    mixing_aug_prob: float = 0.2
+    entity_sub_prob: float = 0.5
+    synonym_aug_prob: float = 0.3
+    word_order_aug_prob: float = 0.2
+    topic_aug_prob: float = 0.3
+    example_texts: Dict[str, List[str]] = field(default_factory=dict)
 
 @dataclass
 class EvaluationConfig:
@@ -203,10 +221,10 @@ class FewTopNERConfig:
     @classmethod
     def from_file(cls, file_path: str) -> 'FewTopNERConfig':
         if file_path.endswith('.json'):
-            with open(file_path, 'r') as f:
+            with open(file_path, 'r', encoding='utf-8') as f:
                 config_dict = json.load(f)
         elif file_path.endswith('.yaml'):
-            with open(file_path, 'r') as f:
+            with open(file_path, 'r', encoding='utf-8') as f:
                 config_dict = yaml.safe_load(f)
         else:
             raise ValueError("Config file must be .json or .yaml")
@@ -226,10 +244,10 @@ class FewTopNERConfig:
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         
         if file_path.endswith('.json'):
-            with open(file_path, 'w') as f:
+            with open(file_path, 'w', encoding='utf-8') as f:
                 json.dump(config_dict, f, indent=2)
         elif file_path.endswith('.yaml'):
-            with open(file_path, 'w') as f:
+            with open(file_path, 'w', encoding='utf-8') as f:
                 yaml.dump(config_dict, f)
         else:
             raise ValueError("Config file must be .json or .yaml")
