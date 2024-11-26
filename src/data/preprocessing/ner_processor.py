@@ -51,7 +51,7 @@ class WikiNeuRalDataset(Dataset):
             'language_id': torch.tensor(feature.language_id, dtype=torch.long)
         }
 
-class WikiNeuRalProcessor:
+class WikiNeurxalProcessor:
     """Processor for WikiNEuRal dataset following the official specifications"""
     
     # Official label mapping from the dataset
