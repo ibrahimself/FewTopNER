@@ -171,28 +171,28 @@ class ContrastiveCrossLingualLearning(nn.Module):
 
 class LanguageCalibration(nn.Module):
     """Enhanced language calibration with cross-lingual alignment"""
-    def __init__(self, config):
+    def __init__(self, model_config):
         super().__init__()
+        self.config = model_config
         
         # Language-specific adapters
         self.language_adapters = nn.ModuleDict({
             lang: nn.Sequential(
-                nn.Linear(config.hidden_size, config.hidden_size // 2),
-                nn.LayerNorm(config.hidden_size // 2),
+                nn.Linear(self.config.hidden_size, self.config.hidden_size),
+                nn.LayerNorm(self.config.hidden_size),
                 nn.ReLU(),
-                nn.Linear(config.hidden_size // 2, config.hidden_size),
-                nn.LayerNorm(config.hidden_size)
+                nn.Dropout(self.config.dropout)
             )
-            for lang in ['en', 'fr', 'de', 'es', 'it']
+            for lang in self.config.languages
         })
         
         # Cross-lingual attention
-        self.cross_lingual_attention = CrossLingualAttention(config)
+        self.cross_lingual_attention = CrossLingualAttention(self.config)
         
         # Contrastive learning
-        self.contrastive_learning = ContrastiveCrossLingualLearning(config)
+        self.contrastive_learning = ContrastiveCrossLingualLearning(self.config)
         
-        self.dropout = nn.Dropout(config.dropout)
+        self.dropout = nn.Dropout(self.config.dropout)
         
     def forward(
         self,
@@ -250,25 +250,49 @@ class PositionalEncoding(nn.Module):
 
 # Update SharedEncoder class to use enhanced alignment
 class SharedEncoder(nn.Module):
-    """Enhanced shared encoder with sophisticated cross-lingual alignment"""
+    """Shared encoder for multilingual entity recognition and topic modeling"""
     def __init__(self, config):
         super().__init__()
         
-        # Previous initialization code remains the same
-        self.xlm_roberta = XLMRobertaModel.from_pretrained('xlm-roberta-base')
+        # Store model config for easy access
+        self.model_config = config.model
+        
+        # XLM-RoBERTa base
+        self.xlm_roberta = XLMRobertaModel.from_pretrained(self.model_config.model_name)
+        
+        # Positional encoding
         self.positional_encoding = PositionalEncoding(
-            config.hidden_size,
-            max_len=config.max_length
+            self.model_config.hidden_size,  # Access through model_config
+            max_len=self.model_config.max_length
         )
         
-        # Enhanced language calibration
-        self.language_calibration = LanguageCalibration(config)
+        # Language calibration
+        self.language_calibration = LanguageCalibration(self.model_config)
         
-        # Rest of the initialization remains the same
-        self.task_projector = TaskProjector(config)
+        # Feature projection
+        self.projection = nn.Linear(
+            self.model_config.hidden_size,
+            self.model_config.projection_size
+        )
+        
+        self.layer_norm = nn.LayerNorm(self.model_config.projection_size)
+        
+        # Initialize weights
         self.apply(self._init_weights)
-        self.gradient_scale = getattr(config, 'gradient_scale', 1.0)
-    
+        
+        # Gradient scaling
+        self.gradient_scale = getattr(self.model_config, 'gradient_scale', 1.0)
+
+    def _init_weights(self, module):
+        """Initialize weights"""
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -278,8 +302,7 @@ class SharedEncoder(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         return_dict: bool = True
     ) -> Dict[str, torch.Tensor]:
-        """Forward pass with enhanced cross-lingual alignment"""
-        # XLM-RoBERTa encoding
+        # Get base model outputs
         outputs = self.xlm_roberta(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -289,40 +312,32 @@ class SharedEncoder(nn.Module):
         )
         
         hidden_states = outputs.last_hidden_state
+        
+        # Add positional encoding
         hidden_states = self.positional_encoding(hidden_states)
         
-        # Enhanced language calibration
-        calibration_outputs = self.language_calibration(
+        # Apply language calibration
+        calibrated_states = self.language_calibration(
             hidden_states,
             language_ids,
             attention_mask
         )
         
-        # Project to task-specific features
-        entity_features, topic_features = self.task_projector(
-            calibration_outputs['hidden_states'],
-            language_ids
-        )
-        
-        if self.training and self.gradient_scale != 1.0:
-            entity_features = entity_features * self.gradient_scale
-            topic_features = topic_features * self.gradient_scale
+        # Project features
+        projected_states = self.projection(calibrated_states)
+        normalized_states = self.layer_norm(projected_states)
         
         if return_dict:
             return {
                 'hidden_states': hidden_states,
-                'calibrated_states': calibration_outputs['hidden_states'],
-                'entity_features': entity_features,
-                'topic_features': topic_features,
-                'attention_mask': attention_mask,
-                'alignment_scores': calibration_outputs['alignment_scores'],
-                'contrastive_loss': calibration_outputs['contrastive_loss']
+                'calibrated_states': calibrated_states,
+                'final_states': normalized_states,
+                'attention_mask': attention_mask
             }
         
         return (
             hidden_states,
-            calibration_outputs['hidden_states'],
-            entity_features,
-            topic_features,
+            calibrated_states,
+            normalized_states,
             attention_mask
         )

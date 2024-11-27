@@ -6,6 +6,7 @@ tqdm>=4.66.0                # Progress bars
 
 # Data processing
 dask>=2023.5.0             # For efficient data manipulation and parallel processing
+dask[dataframe]
 pyarrow>=14.0.1            # For handling Parquet files
 pandas>=2.1.0              # For data manipulation
 

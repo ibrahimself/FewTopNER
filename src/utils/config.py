@@ -9,9 +9,14 @@ class ModelConfig:
     """Base configuration for model architecture"""
     # Model parameters
     model_name: str = "xlm-roberta-base"
-    hidden_size: int = 768  # XLM-RoBERTa hidden size
+    hidden_size: int = 768
+    lstm_hidden_size: int = 512
+    lstm_layers: int = 2
+    entity_feature_size: int = 128
+    num_heads: int = 12 
     dropout: float = 0.1
-    max_length: int = 512
+    max_length: int = 128
+    temperature: int= 0.07
     
     # Feature dimensions
     projection_size: int = 512
@@ -21,7 +26,7 @@ class ModelConfig:
     contrastive_dim: int = 128
     
     # Task-specific parameters
-    num_entity_labels: int = 9  # Including 'O' tag
+    num_entity_labels: int = 9
     num_topics: int = 100
     
     # Transformer settings
@@ -34,26 +39,20 @@ class ModelConfig:
     languages: List[str] = field(default_factory=lambda: ['en', 'fr', 'de', 'es', 'it'])
     language_adapters: bool = True
     
-    # Cross-lingual settings
-    use_language_embeddings: bool = True
-    language_embedding_dim: int = 32
-    cross_lingual_sharing: bool = True
-    
-    # Other architecture settings
-    use_crf: bool = True
-    use_language_adapters: bool = True
-    shared_encoder_layers: int = 12
-    task_specific_layers: int = 2
+    # Training settings
+    batch_size: int = 8
+    gradient_accumulation_steps: int = 4
+    gradient_scale: float = 1.0  # Added this line
+    num_languages_per_episode: int = 2
 
     def to_dict(self) -> Dict:
-        """Convert config to dictionary"""
         return {k: v for k, v in self.__dict__.items()}
 
 @dataclass
 class PreprocessingConfig:
     """Data preprocessing configuration"""
-    wikineural_path: str = "data/ner/wikineural"
-    wikipedia_base_path: str = "data/topic/wikipedia"  # Added this
+    wikineural_path: str = "/content/fewtopner/data/ner/wikineural"
+    wikipedia_base_path: str = "/content/fewtopner/data/topic/wikipedia"  
     wiki_dump_date: str = "20231101"
     max_ner_length: int = 128
     min_text_length: int = 100

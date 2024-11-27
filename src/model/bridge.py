@@ -13,26 +13,26 @@ class CrossTaskAttention(nn.Module):
         super().__init__()
         
         # Multi-head attention parameters
-        self.num_heads = config.bridge_num_heads
-        self.head_dim = config.hidden_size // self.num_heads
+        self.num_heads = config.model.bridge_num_heads
+        self.head_dim = config.model.hidden_size // self.num_heads
         self.scaling = self.head_dim ** -0.5
         
         # Task-specific projections
-        self.ner_q_proj = nn.Linear(config.entity_feature_size, config.hidden_size)
-        self.ner_k_proj = nn.Linear(config.entity_feature_size, config.hidden_size)
-        self.ner_v_proj = nn.Linear(config.entity_feature_size, config.hidden_size)
+        self.ner_q_proj = nn.Linear(config.model.entity_feature_size, config.model.hidden_size)
+        self.ner_k_proj = nn.Linear(config.model.entity_feature_size, config.model.hidden_size)
+        self.ner_v_proj = nn.Linear(config.model.entity_feature_size, config.model.hidden_size)
         
-        self.topic_q_proj = nn.Linear(config.topic_feature_size, config.hidden_size)
-        self.topic_k_proj = nn.Linear(config.topic_feature_size, config.hidden_size)
-        self.topic_v_proj = nn.Linear(config.topic_feature_size, config.hidden_size)
+        self.topic_q_proj = nn.Linear(config.model.topic_feature_size, config.model.hidden_size)
+        self.topic_k_proj = nn.Linear(config.model.topic_feature_size, config.model.hidden_size)
+        self.topic_v_proj = nn.Linear(config.model.topic_feature_size, config.model.hidden_size)
         
         # Language-specific biases
         self.language_biases = nn.ParameterDict({
-            lang: nn.Parameter(torch.zeros(config.hidden_size))
+            lang: nn.Parameter(torch.zeros(config.model.hidden_size))
             for lang in ['en', 'fr', 'de', 'es', 'it']
         })
         
-        self.dropout = nn.Dropout(config.attention_dropout)
+        self.dropout = nn.Dropout(config.model.attention_dropout)
         
     def forward(
         self,
@@ -92,30 +92,30 @@ class TaskGating(nn.Module):
         
         # Task-specific transformations
         self.ner_transform = nn.Sequential(
-            nn.Linear(config.entity_feature_size, config.hidden_size),
-            nn.LayerNorm(config.hidden_size),
+            nn.Linear(config.model.entity_feature_size, config.model.hidden_size),
+            nn.LayerNorm(config.model.hidden_size),
             nn.ReLU()
         )
         
         self.topic_transform = nn.Sequential(
-            nn.Linear(config.topic_feature_size, config.hidden_size),
-            nn.LayerNorm(config.hidden_size),
+            nn.Linear(config.model.topic_feature_size, config.model.hidden_size),
+            nn.LayerNorm(config.model.hidden_size),
             nn.ReLU()
         )
         
         # Language-aware gate networks
         self.gate_networks = nn.ModuleDict({
             lang: nn.Sequential(
-                nn.Linear(config.hidden_size * 2, config.hidden_size),
-                nn.LayerNorm(config.hidden_size),
+                nn.Linear(config.model.hidden_size * 2, config.model.hidden_size),
+                nn.LayerNorm(config.model.hidden_size),
                 nn.ReLU(),
-                nn.Linear(config.hidden_size, 2),  # 2 gates: one for each task
+                nn.Linear(config.model.hidden_size, 2),  # 2 gates: one for each task
                 nn.Sigmoid()
             )
             for lang in ['en', 'fr', 'de', 'es', 'it']
         })
         
-        self.dropout = nn.Dropout(config.dropout)
+        self.dropout = nn.Dropout(config.model.dropout)
         
     def forward(
         self,
@@ -157,29 +157,29 @@ class LightweightBridge(nn.Module):
         # Feature fusion with language adaptation
         self.ner_fusion = nn.ModuleDict({
             lang: nn.Sequential(
-                nn.Linear(config.hidden_size * 2, config.hidden_size),
-                nn.LayerNorm(config.hidden_size),
+                nn.Linear(config.model.hidden_size * 2, config.model.hidden_size),
+                nn.LayerNorm(config.model.hidden_size),
                 nn.ReLU(),
-                nn.Dropout(config.dropout),
-                nn.Linear(config.hidden_size, config.entity_feature_size)
+                nn.Dropout(config.model.dropout),
+                nn.Linear(config.model.hidden_size, config.model.entity_feature_size)
             )
             for lang in ['en', 'fr', 'de', 'es', 'it']
         })
         
         self.topic_fusion = nn.ModuleDict({
             lang: nn.Sequential(
-                nn.Linear(config.hidden_size * 2, config.hidden_size),
-                nn.LayerNorm(config.hidden_size),
+                nn.Linear(config.model.hidden_size * 2, config.model.hidden_size),
+                nn.LayerNorm(config.model.hidden_size),
                 nn.ReLU(),
-                nn.Dropout(config.dropout),
-                nn.Linear(config.hidden_size, config.topic_feature_size)
+                nn.Dropout(config.model.dropout),
+                nn.Linear(config.model.hidden_size, config.model.topic_feature_size)
             )
             for lang in ['en', 'fr', 'de', 'es', 'it']
         })
         
         # Task-specific normalization
-        self.ner_norm = nn.LayerNorm(config.entity_feature_size)
-        self.topic_norm = nn.LayerNorm(config.topic_feature_size)
+        self.ner_norm = nn.LayerNorm(config.model.entity_feature_size)
+        self.topic_norm = nn.LayerNorm(config.model.topic_feature_size)
         
     def forward(
         self,

@@ -13,17 +13,17 @@ class EntityPrototypeNetwork(nn.Module):
         
         # Projection layers
         self.projector = nn.Sequential(
-            nn.Linear(config.entity_feature_size, config.prototype_dim),
-            nn.LayerNorm(config.prototype_dim),
+            nn.Linear(config.model.entity_feature_size, config.model.prototype_dim),
+            nn.LayerNorm(config.model.prototype_dim),
             nn.ReLU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.prototype_dim, config.prototype_dim)
+            nn.Dropout(config.model.dropout),
+            nn.Linear(config.model.prototype_dim, config.model.prototype_dim)
         )
         
         # Initialize prototype memory
         self.register_buffer(
             'prototypes',
-            torch.zeros(config.num_entity_labels, config.prototype_dim)
+            torch.zeros(config.model.num_entity_labels, config.model.prototype_dim)
         )
         
         # Temperature parameter for distance scaling
@@ -54,32 +54,32 @@ class EntityEncoder(nn.Module):
         
         # BiLSTM layers
         self.bilstm = nn.LSTM(
-            input_size=config.hidden_size,
-            hidden_size=config.lstm_hidden_size,
-            num_layers=config.lstm_layers,
+            input_size=config.model.hidden_size,
+            hidden_size=config.model.lstm_hidden_size,
+            num_layers=config.model.lstm_layers,
             bidirectional=True,
-            dropout=config.dropout if config.lstm_layers > 1 else 0,
+            dropout=config.model.dropout if config.model.lstm_layers > 1 else 0,
             batch_first=True
         )
         
         # Language-specific adapters
         self.language_adapters = nn.ModuleDict({
             lang: nn.Sequential(
-                nn.Linear(config.hidden_size, config.hidden_size),
-                nn.LayerNorm(config.hidden_size),
+                nn.Linear(self.config.model.hidden_size, self.config.model.hidden_size),
+                nn.LayerNorm(self.config.model.hidden_size),
                 nn.ReLU(),
-                nn.Linear(config.hidden_size, config.hidden_size)
+                nn.Linear(self.config.model.hidden_size, self.config.model.hidden_size)
             )
             for lang in ['en', 'fr', 'de', 'es', 'it']
         })
         
         # Output projection
         self.projection = nn.Linear(
-            2 * config.lstm_hidden_size,
-            config.entity_feature_size
+            2 * self.config.model.lstm_hidden_size,
+            self.config.model.entity_feature_size
         )
         
-        self.dropout = nn.Dropout(config.dropout)
+        self.dropout = nn.Dropout(self.config.model.dropout)
 
     def forward(
         self,
@@ -132,15 +132,14 @@ class EntityBranch(nn.Module):
         self.config = config
         
         # Entity encoder
-        self.encoder = EntityEncoder(config)
+        self.encoder = EntityEncoder(self.config)
         
         # Prototype network
-        self.prototype_network = EntityPrototypeNetwork(config)
+        self.prototype_network = EntityPrototypeNetwork(self.config)
         
         # CRF layer
         self.crf = CRF(
-            num_tags=config.num_entity_labels,
-            batch_first=True
+            num_labels=self.config.model.num_entity_labels
         )
         
         # Loss weights based on WikiNEuRal dataset statistics
@@ -209,10 +208,10 @@ class EntityBranch(nn.Module):
             
             # Compute distances to support set examples
             distances = torch.cdist(
-                prototype_features.view(-1, self.config.prototype_dim),
-                support_features.view(-1, self.config.prototype_dim)
+                prototype_features.view(-1, self.config.model.prototype_dim),
+                support_features.view(-1, self.config.model.prototype_dim)
             )
-            emissions = -distances.view(prototype_features.shape[0], -1, self.config.num_entity_labels)
+            emissions = -distances.view(prototype_features.shape[0], -1, self.config.model.num_entity_labels)
         else:
             # Regular sequence labeling mode
             emissions = self.crf.get_emission_score(prototype_features)
@@ -228,7 +227,7 @@ class EntityBranch(nn.Module):
             # Combine losses
             outputs['loss'] = crf_loss
             if 'prototype_loss' in outputs:
-                outputs['loss'] += self.config.prototype_loss_weight * outputs['prototype_loss']
+                outputs['loss'] += self.config.model.prototype_loss_weight * outputs['prototype_loss']
         else:
             # Decode best path
             predictions = self.crf.decode(emissions, mask=attention_mask.bool())
@@ -249,4 +248,4 @@ class EntityBranch(nn.Module):
             query_features, support_features.transpose(-2, -1)
         )
         
-        return similarities / np.sqrt(self.config.prototype_dim)
+        return similarities / np.sqrt(self.config.model.prototype_dim)

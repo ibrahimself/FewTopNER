@@ -14,11 +14,11 @@ class TopicPrototypeNetwork(nn.Module):
         
         # Projection layers
         self.projector = nn.Sequential(
-            nn.Linear(config.topic_hidden_size, config.prototype_dim),
-            nn.LayerNorm(config.prototype_dim),
+            nn.Linear(config.model.topic_hidden_size, config.model.prototype_dim),
+            nn.LayerNorm(config.model.prototype_dim),
             nn.ReLU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.prototype_dim, config.prototype_dim)
+            nn.Dropout(config.model.dropout),
+            nn.Linear(config.model.prototype_dim, config.model.prototype_dim)
         )
         
         # Learned temperature parameter
@@ -48,20 +48,20 @@ class TopicEncoder(nn.Module):
         # Language adapters
         self.language_adapters = nn.ModuleDict({
             lang: nn.Sequential(
-                nn.Linear(config.hidden_size, config.hidden_size),
-                nn.LayerNorm(config.hidden_size),
+                nn.Linear(config.model.hidden_size, config.model.hidden_size),
+                nn.LayerNorm(config.model.hidden_size),
                 nn.ReLU(),
-                nn.Linear(config.hidden_size, config.hidden_size)
+                nn.Linear(config.model.hidden_size, config.model.hidden_size)
             )
             for lang in ['en', 'fr', 'de', 'es', 'it']
         })
         
         # Feature fusion
         self.topic_fusion = nn.Sequential(
-            nn.Linear(config.hidden_size + config.num_topics, config.topic_hidden_size),
-            nn.LayerNorm(config.topic_hidden_size),
+            nn.Linear(config.model.hidden_size + config.model.num_topics, config.model.topic_hidden_size),
+            nn.LayerNorm(config.model.topic_hidden_size),
             nn.ReLU(),
-            nn.Dropout(config.dropout)
+            nn.Dropout(config.model.dropout)
         )
 
     def set_lda_model(self, language: str, lda_model: LdaModel, dictionary: Dictionary):
@@ -83,7 +83,7 @@ class TopicEncoder(nn.Module):
         # Get topic distributions
         topic_dists = []
         for bow in bows:
-            dist = np.zeros(self.config.num_topics)
+            dist = np.zeros(self.config.model.num_topics)
             for topic_id, prob in lda_model.get_document_topics(bow):
                 dist[topic_id] = prob
             topic_dists.append(dist)
@@ -147,11 +147,11 @@ class TopicBranch(nn.Module):
         self.prototype_network = TopicPrototypeNetwork(config)
         
         # Topic classifier
-        self.topic_classifier = nn.Linear(config.prototype_dim, config.num_topics)
+        self.topic_classifier = nn.Linear(config.model.prototype_dim, config.model.num_topics)
         
         # Loss weights
-        self.prototype_weight = config.prototype_weight
-        self.classification_weight = config.classification_weight
+        self.prototype_weight = config.model.prototype_weight
+        self.classification_weight = config.model.classification_weight
     
     def forward(
         self,

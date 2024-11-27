@@ -2,8 +2,10 @@
 model:
   model_name: "xlm-roberta-base"
   hidden_size: 768
+  num_heads: 12
+  temperature: 0.07
   dropout: 0.1
-  max_length: 512
+  max_length: 128
   projection_size: 512
   entity_feature_size: 256
   topic_feature_size: 256
@@ -17,18 +19,15 @@ model:
   attention_dropout: 0.1
   languages: ["en", "fr", "de", "es", "it"]
   language_adapters: true
-  use_language_embeddings: true
-  language_embedding_dim: 32
-  cross_lingual_sharing: true
-  use_crf: true
-  use_language_adapters: true
-  shared_encoder_layers: 12
-  task_specific_layers: 2
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  gradient_scale: 1.0
+  num_languages_per_episode: 2
 
 # Preprocessing Configuration
 preprocessing:
-  wikineural_path: "data/ner/wikineural"
-  wikipedia_path: "data/topic/wikipedia"
+  wikineural_path: "/content/fewtopner/data/ner/wikineural"
+  wikipedia_base_path: "/content/fewtopner/data/topic/wikipedia"
   wiki_dump_date: "20231101"
   max_ner_length: 128
   min_text_length: 100
