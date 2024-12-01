@@ -50,42 +50,38 @@ class FewTopNERTrainer:
         }
         
     def _create_optimizer(self):
-        """Create optimizer with layer-wise learning rates"""
-        # Collect parameters with different learning rates
-        optimizer_groups = [
+        no_decay = ['bias', 'LayerNorm.weight']
+        optimizer_grouped_parameters = [
             {
-                'params': self.model.shared_encoder.parameters(),
-                'lr': self.config.encoder_lr
+                'params': [p for n, p in self.model.named_parameters()
+                          if not any(nd in n for nd in no_decay)],
+                'lr': float(self.config.optimizer.encoder_lr),
+                'weight_decay': float(self.config.optimizer.weight_decay)
             },
             {
-                'params': self.model.entity_branch.parameters(),
-                'lr': self.config.task_lr
-            },
-            {
-                'params': self.model.topic_branch.parameters(),
-                'lr': self.config.task_lr
-            },
-            {
-                'params': self.model.bridge.parameters(),
-                'lr': self.config.bridge_lr
+                'params': [p for n, p in self.model.named_parameters()
+                          if any(nd in n for nd in no_decay)],
+                'lr': float(self.config.optimizer.task_lr),
+                'weight_decay': 0.0
             }
         ]
         
         return AdamW(
-            optimizer_groups,
-            weight_decay=self.config.weight_decay,
-            eps=self.config.adam_epsilon
+            optimizer_grouped_parameters,
+            eps=float(self.config.optimizer.adam_epsilon),
+            betas=(float(self.config.optimizer.beta1), 
+                  float(self.config.optimizer.beta2))
         )
 
     def _create_scheduler(self):
         """Create learning rate scheduler with warmup"""
         total_steps = (
-            self.config.num_epochs * 
-            self.config.episodes_per_epoch * 
+            self.config.training.num_epochs * 
+            self.config.training.episodes_per_epoch * 
             len(self.train_dataloaders)
         )
         
-        warmup_steps = int(total_steps * self.config.warmup_ratio)
+        warmup_steps = int(total_steps * self.config.optimizer.warmup_ratio)
         
         return get_linear_schedule_with_warmup(
             self.optimizer,
@@ -97,9 +93,9 @@ class FewTopNERTrainer:
         """Main training loop with episode-based few-shot learning"""
         logger.info("Starting training...")
         
-        for epoch in range(self.config.num_epochs):
+        for epoch in range(self.config.training.num_epochs):
             self.current_epoch = epoch
-            logger.info(f"\nEpoch {epoch + 1}/{self.config.num_epochs}")
+            logger.info(f"\nEpoch {epoch + 1}/{self.config.training.num_epochs}")
             
             # Training phase
             train_metrics = self._train_epoch()
@@ -169,10 +165,10 @@ class FewTopNERTrainer:
             total_loss.backward()
             
             # Gradient clipping
-            if self.config.max_grad_norm > 0:
+            if self.config.optimizer.max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
-                    self.config.max_grad_norm
+                    self.config.optimizer.max_grad_norm
                 )
             
             self.optimizer.step()

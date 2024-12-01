@@ -10,9 +10,10 @@ class ModelConfig:
     # Model parameters
     model_name: str = "xlm-roberta-base"
     hidden_size: int = 768
-    lstm_hidden_size: int = 512
+    lstm_hidden_size: int = 256
     lstm_layers: int = 2
     entity_feature_size: int = 128
+    topic_hidden_size: int = 256
     num_heads: int = 12 
     dropout: float = 0.1
     max_length: int = 128
@@ -28,6 +29,18 @@ class ModelConfig:
     # Task-specific parameters
     num_entity_labels: int = 9
     num_topics: int = 100
+
+    # Loss weights
+    prototype_weight: float = 1.0    
+    classification_weight: float = 1.0 
+    contrastive_weight: float = 0.1 
+    
+    # Bridge parameters
+    bridge_num_heads: int = 8           
+    bridge_dropout: float = 0.1        
+    bridge_hidden_size: int = 256      
+    bridge_attention_dropout: float = 0.1  
+    bridge_temperature: float = 0.07   
     
     # Transformer settings
     num_attention_heads: int = 8
@@ -42,7 +55,7 @@ class ModelConfig:
     # Training settings
     batch_size: int = 8
     gradient_accumulation_steps: int = 4
-    gradient_scale: float = 1.0  # Added this line
+    gradient_scale: float = 1.0 
     num_languages_per_episode: int = 2
 
     def to_dict(self) -> Dict:
@@ -53,6 +66,7 @@ class PreprocessingConfig:
     """Data preprocessing configuration"""
     wikineural_path: str = "/content/fewtopner/data/ner/wikineural"
     wikipedia_base_path: str = "/content/fewtopner/data/topic/wikipedia"  
+    model_dir: str = "/content/fewtopner/data/preprocessing_output"
     wiki_dump_date: str = "20231101"
     max_ner_length: int = 128
     min_text_length: int = 100
@@ -95,16 +109,28 @@ class OptimizerConfig:
     encoder_lr: float = 2e-5
     task_lr: float = 1e-4
     bridge_lr: float = 1e-4
-    
-    # Scheduler
-    warmup_ratio: float = 0.1
-    max_grad_norm: float = 1.0
-    
-    # AdamW parameters
+
+    # Optimizer parameters
     weight_decay: float = 0.01
     adam_epsilon: float = 1e-8
+    max_grad_norm: float = 1.0
+
+    # Scheduler parameters
+    warmup_ratio: float = 0.1
     beta1: float = 0.9
     beta2: float = 0.999
+
+    def __post_init__(self):
+        """Convert string values to proper types"""
+        self.encoder_lr = float(self.encoder_lr)
+        self.task_lr = float(self.task_lr)
+        self.bridge_lr = float(self.bridge_lr)
+        self.adam_epsilon = float(self.adam_epsilon)
+        self.weight_decay = float(self.weight_decay)
+        self.max_grad_norm = float(self.max_grad_norm)
+        self.warmup_ratio = float(self.warmup_ratio)
+        self.beta1 = float(self.beta1)
+        self.beta2 = float(self.beta2)
 
 @dataclass
 class TrainingConfig:
@@ -126,20 +152,19 @@ class TrainingConfig:
     device: str = "cuda"
     fp16: bool = False
     
-    # Checkpointing
-    output_dir: str = "outputs"
-    save_steps: int = 1000
-    save_total_limit: int = 5
-    
-    # Logging
-    logging_steps: int = 100
-    evaluation_strategy: str = "epoch"
-    log_level: str = "info"
-
+    # Wandb settings
     use_wandb: bool = True
     wandb_project: str = "FewTopNER"
     wandb_entity: Optional[str] = None
     wandb_group: Optional[str] = None
+
+    # Output settings
+    output_dir: str = "outputs"
+    save_steps: int = 1000
+    save_total_limit: int = 5
+    logging_steps: int = 100
+    evaluation_strategy: str = "epoch"
+    log_level: str = "info"
 
 @dataclass
 class BridgeConfig:

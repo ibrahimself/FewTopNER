@@ -2,17 +2,25 @@
 model:
   model_name: "xlm-roberta-base"
   hidden_size: 768
-  num_heads: 12
-  temperature: 0.07
   dropout: 0.1
   max_length: 128
   projection_size: 512
   entity_feature_size: 256
   topic_feature_size: 256
+  topic_hidden_size: 256
+  lstm_hidden_size: 256
   prototype_dim: 128
   contrastive_dim: 128
   num_entity_labels: 9
   num_topics: 100
+  prototype_weight: 1.0
+  classification_weight: 1.0
+  contrastive_weight: 0.1
+  bridge_num_heads: 8
+  bridge_dropout: 0.1
+  bridge_hidden_size: 256
+  bridge_attention_dropout: 0.1
+  bridge_temperature: 0.07
   num_attention_heads: 8
   intermediate_size: 3072
   hidden_act: "gelu"
@@ -36,6 +44,7 @@ preprocessing:
   max_word_freq: 0.7
   max_vocab_size: 50000
   cache_dir: "cache"
+  model_dir: "/content/fewtopner/data/preprocessing_output"
   use_cache: true
 
 # Data Configuration
@@ -56,13 +65,13 @@ data:
 
 # Optimizer Configuration
 optimizer:
-  encoder_lr: 2e-5
-  task_lr: 1e-4
-  bridge_lr: 1e-4
-  warmup_ratio: 0.1
-  max_grad_norm: 1.0
+  encoder_lr: 2.0e-5
+  task_lr: 1.0e-4
+  bridge_lr: 1.0e-4
   weight_decay: 0.01
-  adam_epsilon: 1e-8
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+  warmup_ratio: 0.1
   beta1: 0.9
   beta2: 0.999
 
@@ -86,6 +95,7 @@ training:
   evaluation_strategy: "epoch"
   log_level: "info"
   use_wandb: true
+  wandb_project: "FewTopNER"
 
 # Bridge Configuration
 bridge:

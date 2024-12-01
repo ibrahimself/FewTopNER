@@ -18,10 +18,10 @@ class EpisodeBuilder:
         self.k_shot = config.data.k_shot
         self.n_query = config.data.n_query
         self.min_examples_per_class = config.data.min_examples_per_class
-        self.num_languages_per_episode = config.data.num_languages_per_episode  # Fix: access through data config
+        self.num_languages_per_episode = config.data.num_languages_per_episode 
         
         # Language settings
-        self.languages = config.model.languages  # Use languages from model config
+        self.languages = config.model.languages 
         
         # NER label mapping from WikiNEuRal
         self.ner_labels = {
@@ -67,20 +67,20 @@ class EpisodeBuilder:
         # Create loaders
         support_loader = DataLoader(
             support_examples,
-            batch_size=self.config.data.support_batch_size,  # Fix: access through data config
+            batch_size=self.config.data.support_batch_size,  
             shuffle=True,
             collate_fn=self._collate_fn,
-            num_workers=self.config.data.num_workers,  # Add num_workers
-            pin_memory=self.config.data.pin_memory    # Add pin_memory
+            num_workers=self.config.data.num_workers,  
+            pin_memory=self.config.data.pin_memory 
         )
         
         query_loader = DataLoader(
             query_examples,
-            batch_size=self.config.data.query_batch_size,  # Fix: access through data config
+            batch_size=self.config.data.query_batch_size, 
             shuffle=True,
             collate_fn=self._collate_fn,
-            num_workers=self.config.data.num_workers,  # Add num_workers
-            pin_memory=self.config.data.pin_memory    # Add pin_memory
+            num_workers=self.config.data.num_workers,  
+            pin_memory=self.config.data.pin_memory  
         )
         
         return support_loader, query_loader
@@ -125,7 +125,6 @@ class EpisodeBuilder:
                 examples = entity_examples[entity_type]
                 selected = random.sample(examples, self.k_shot + self.n_query)
                 
-                # Add language ID to examples
                 for example in selected:
                     example['language_id'] = lang_idx
                 
