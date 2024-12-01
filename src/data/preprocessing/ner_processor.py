@@ -91,7 +91,7 @@ class WikiNeuralProcessor:
         processed_data = {}
         base_path = Path(self.config.preprocessing.wikineural_path) / language
         
-        for split in ['train', 'dev', 'test']:
+        for split in ['train', 'val', 'test']:
             file_path = base_path / f"{split}.conllu"
             if not file_path.exists():
                 logger.warning(f"File not found: {file_path}")

@@ -33,11 +33,11 @@ class FewTopNERDataLoader:
         }
         
         # Load initial data
-        self.datasets = self.load_all_languages(['train', 'dev', 'test'])
+        self.datasets = self.load_all_languages(['train', 'val', 'test'])
 
     def load_all_languages(
         self,
-        splits: List[str] = ['train', 'dev', 'test']
+        splits: List[str] = ['train', 'val', 'test']
     ) -> Dict[str, Dict[str, FewTopNERDataset]]:
         """Load and process all language data"""
         datasets = {}
@@ -218,7 +218,7 @@ class FewShotEpisodeLoader:
 
 def create_dataloaders(
     config,
-    splits: List[str] = ['train', 'dev', 'test']
+    splits: List[str] = ['train', 'val', 'test']
 ) -> Tuple[Dict[str, Dict[str, DataLoader]], FewShotEpisodeLoader]:
     """Create all necessary dataloaders"""
     try:
@@ -296,7 +296,7 @@ class DataLoaderManager:
     
     def get_val_loader(self, language: str) -> Optional[DataLoader]:
         """Get validation dataloader for specific language"""
-        return self.dataloaders.get('dev', {}).get(language)
+        return self.dataloaders.get('val', {}).get(language)
     
     def get_test_loader(self, language: str) -> Optional[DataLoader]:
         """Get test dataloader for specific language"""
