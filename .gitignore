@@ -2,3 +2,4 @@ data/*
 .DS_Store
 setup.py
 prepare_data.py
+.gitignore
