@@ -3,7 +3,7 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 from seqeval.metrics import classification_report, f1_score, precision_score, recall_score
-from sklearn.metrics import v_measure_score, normalized_mutual_info_score, coherence_score
+from sklearn.metrics import v_measure_score, normalized_mutual_info_score
 import logging
 from scipy.spatial.distance import cosine
 

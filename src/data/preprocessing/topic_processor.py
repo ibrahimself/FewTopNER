@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from collections import defaultdict
 import os
+import pandas as pd
 from gensim.models import LdaModel
 from gensim.corpora import Dictionary
 import logging
@@ -74,7 +75,7 @@ class WikiTopicProcessor:
         return self.wiki_dfs
 
     def process_wiki_data(self, language: str) -> dd.DataFrame:
-        """Process Wikipedia data for a specific language"""
+        """Process Wikipedia data for a specific language with optimizations"""
         if language not in self.wiki_dfs:
             logger.error(f"No data loaded for language: {language}")
             return None
@@ -82,15 +83,22 @@ class WikiTopicProcessor:
         df = self.wiki_dfs[language]
         
         try:
-            # Basic filtering
-            df = df[df.text.notnull()]
+            df = df[df.text.notnull()].compute()
             
-            # Clean text in parallel
-            df['cleaned_text'] = df.text.map_partitions(
-                lambda x: x.apply(lambda text: self._clean_text(text, language))
-            )
+            chunk_size = 1000
+            n_chunks = len(df) // chunk_size + 1
             
-            return df
+            processed_chunks = []
+            for i in range(n_chunks):
+                start_idx = i * chunk_size
+                end_idx = min((i + 1) * chunk_size, len(df))
+                chunk = df.iloc[start_idx:end_idx]                
+                cleaned_chunk = chunk.text.apply(lambda x: self._clean_text(x, language))
+                processed_chunks.append(cleaned_chunk)
+                
+                logger.info(f"Processed chunk {i+1}/{n_chunks} for {language}")
+                
+            return pd.concat(processed_chunks)
             
         except Exception as e:
             logger.error(f"Error processing {language} Wikipedia data: {e}")
@@ -220,63 +228,69 @@ class WikiTopicProcessor:
         df: dd.DataFrame,
         language: str,
         num_topics: int = 100,
-        chunksize: int = 2000
+        chunksize: int = 1000  # Reduced chunk size
     ) -> Tuple[LdaModel, Dictionary]:
-        """Extract topics using LDA
-        
-        Args:
-            df: Dask DataFrame with Wikipedia articles
-            language: Language code
-            num_topics: Number of topics to extract
-            chunksize: Size of chunks for processing
-        
-        Returns:
-            LDA model and dictionary
-        """
+        """Extract topics using LDA with memory optimizations"""
         try:
             nlp = self.nlp_models.get(language)
             if nlp is None:
                 logger.error(f"No spaCy model available for {language}")
                 return None, None
 
-            # Process documents in chunks
-            documents = []
-            logger.info(f"Processing documents for {language}")
+            # Convert to pandas for faster processing of small datasets
+            texts = df.compute() if isinstance(df, dd.DataFrame) else df
             
-            for chunk in df.map_partitions(lambda x: x.text.tolist()).compute():
+            # Process documents in smaller chunks with progress tracking
+            documents = []
+            n_chunks = len(texts) // chunksize + 1
+            
+            for i in range(n_chunks):
+                start_idx = i * chunksize
+                end_idx = min((i + 1) * chunksize, len(texts))
+                chunk = texts[start_idx:end_idx]
+                
                 chunk_docs = []
                 for text in chunk:
                     if isinstance(text, str):
-                        doc = nlp(text.lower())
-                        # Extract lemmatized tokens, excluding stopwords and punctuation
-                        tokens = [
-                            token.lemma_ for token in doc 
-                            if not token.is_stop and not token.is_punct 
-                            and len(token.text) > 2
-                        ]
-                        if len(tokens) >= self.config.preprocessing.min_text_length:
-                            chunk_docs.append(tokens)
+                        # Disable unnecessary pipeline components for speed
+                        with nlp.select_pipes(enable=['tok2vec', 'tagger', 'lemmatizer']):
+                            doc = nlp(text.lower())
+                            tokens = [
+                                token.lemma_ for token in doc 
+                                if not token.is_stop and not token.is_punct 
+                                and len(token.text) > 2
+                            ]
+                            if len(tokens) >= self.config.preprocessing.min_text_length:
+                                chunk_docs.append(tokens)
+                
                 documents.extend(chunk_docs)
+                logger.info(f"Processed chunk {i+1}/{n_chunks} for {language}")
+                
+                # Clear memory periodically
+                if i % 5 == 0:
+                    import gc
+                    gc.collect()
 
             if not documents:
                 logger.error(f"No valid documents found for {language}")
                 return None, None
 
-            # Create dictionary
+            # Create and filter dictionary with progress logging
             logger.info(f"Creating dictionary for {language}")
             dictionary = Dictionary(documents)
             
-            # Filter extremes
+            logger.info(f"Filtering dictionary extremes for {language}")
             dictionary.filter_extremes(
                 no_below=self.config.preprocessing.min_word_freq,
                 no_above=self.config.preprocessing.max_word_freq,
                 keep_n=self.config.preprocessing.max_vocab_size
             )
 
-            # Create corpus
+            # Create corpus with progress logging
+            logger.info(f"Creating corpus for {language}")
             corpus = [dictionary.doc2bow(doc) for doc in documents]
 
-            # Train LDA model
+            # Train LDA model with memory-efficient settings
             logger.info(f"Training LDA model for {language}")
             lda_model = LdaModel(
                 corpus=corpus,
@@ -285,7 +299,8 @@ class WikiTopicProcessor:
                 random_state=self.config.training.seed,
                 alpha='auto',
                 per_word_topics=True,
-                chunksize=chunksize
+                chunksize=chunksize,
+                passes=1  # Reduce passes for initial processing
             )
 
             return lda_model, dictionary
