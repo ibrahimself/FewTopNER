@@ -6,37 +6,8 @@ from transformers import XLMRobertaModel
 from gensim.models import LdaModel
 from gensim.corpora import Dictionary
 
-class TopicPrototypeNetwork(nn.Module):
-    """Prototype network for topic modeling"""
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        
-        # Projection layers
-        self.projector = nn.Sequential(
-            nn.Linear(config.model.topic_hidden_size, config.model.prototype_dim),
-            nn.LayerNorm(config.model.prototype_dim),
-            nn.ReLU(),
-            nn.Dropout(config.model.dropout),
-            nn.Linear(config.model.prototype_dim, config.model.prototype_dim)
-        )
-        
-        # Learned temperature parameter
-        self.temperature = nn.Parameter(torch.tensor([1.0]))
-        
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        return self.projector(features)
-    
-    def compute_similarities(self, query_features: torch.Tensor, support_features: torch.Tensor) -> torch.Tensor:
-        """Compute scaled cosine similarities"""
-        query_norm = query_features / query_features.norm(dim=-1, keepdim=True)
-        support_norm = support_features / support_features.norm(dim=-1, keepdim=True)
-        
-        similarities = torch.matmul(query_norm, support_norm.transpose(-2, -1))
-        return similarities / self.temperature
-
 class TopicEncoder(nn.Module):
-    """Combined LDA and Transformer encoder for topic modeling"""
+    """Combined LDA and Transformer encoder for topic modeling with proper device handling"""
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -70,9 +41,13 @@ class TopicEncoder(nn.Module):
         self.dictionaries[language] = dictionary
     
     def get_lda_features(self, texts: List[str], language: str) -> torch.Tensor:
-        """Get LDA topic distributions"""
+        """Get LDA topic distributions with device handling"""
+        device = next(self.parameters()).device
+        
         if language not in self.lda_models:
-            raise ValueError(f"No LDA model found for language: {language}")
+            print(f"Warning: No LDA model found for language: {language}. Using zero vector.")
+            return torch.zeros(len(texts), self.config.model.num_topics, 
+                             dtype=torch.float, device=device)
             
         lda_model = self.lda_models[language]
         dictionary = self.dictionaries[language]
@@ -88,7 +63,8 @@ class TopicEncoder(nn.Module):
                 dist[topic_id] = prob
             topic_dists.append(dist)
             
-        return torch.tensor(topic_dists, dtype=torch.float)
+        # Create tensor on the same device as the model
+        return torch.tensor(topic_dists, dtype=torch.float, device=device)
     
     def forward(
         self,
@@ -98,35 +74,41 @@ class TopicEncoder(nn.Module):
         language_ids: torch.Tensor,
         languages: List[str]
     ) -> torch.Tensor:
-        """
-        Encode topics with language-specific processing
-        
-        Args:
-            sequence_output: XLM-R outputs [batch_size, seq_len, hidden_size]
-            attention_mask: Attention mask [batch_size, seq_len]
-            texts: Original texts
-            language_ids: Language identifiers [batch_size]
-            languages: List of language codes
-        """
+        """Forward pass with consistent device handling"""
+        device = sequence_output.device
         batch_size = sequence_output.size(0)
+        
+        # Ensure all inputs are on the correct device
+        attention_mask = attention_mask.to(device)
+        language_ids = language_ids.to(device)
         
         # Apply language-specific adapters
         adapted_outputs = torch.zeros_like(sequence_output)
         for lang_id, lang in enumerate(languages):
             lang_mask = (language_ids == lang_id).view(-1, 1, 1)
-            adapted_outputs += lang_mask * self.language_adapters[lang](sequence_output)
+            adapted_output = self.language_adapters[lang](sequence_output)
+            adapted_outputs += lang_mask * adapted_output
         
         # Pool sequence outputs
         masked_outputs = adapted_outputs * attention_mask.unsqueeze(-1)
-        pooled_outputs = masked_outputs.sum(1) / attention_mask.sum(1).unsqueeze(-1)
+        pooled_outputs = masked_outputs.sum(1) / (attention_mask.sum(1).unsqueeze(-1) + 1e-10)
         
         # Get LDA features for each language
-        lda_features = []
+        lda_features_list = []
         for i, text in enumerate(texts):
-            lang = languages[language_ids[i]]
+            lang = languages[language_ids[i].item()]
             lda_feat = self.get_lda_features([text], lang)
-            lda_features.append(lda_feat)
-        lda_features = torch.cat(lda_features, dim=0)
+            lda_features_list.append(lda_feat)
+        
+        # Concatenate LDA features
+        if lda_features_list:
+            lda_features = torch.cat(lda_features_list, dim=0)
+        else:
+            lda_features = torch.zeros(batch_size, self.config.model.num_topics, device=device)
+        
+        # Ensure both features are on the same device before concatenating
+        pooled_outputs = pooled_outputs.to(device)
+        lda_features = lda_features.to(device)
         
         # Combine features
         combined_features = torch.cat([pooled_outputs, lda_features], dim=-1)
@@ -140,7 +122,7 @@ class TopicBranch(nn.Module):
         super().__init__()
         self.config = config
         
-        # Topic encoder
+        # Topic encoder with device handling
         self.encoder = TopicEncoder(config)
         
         # Prototype network
@@ -153,17 +135,36 @@ class TopicBranch(nn.Module):
         self.prototype_weight = config.model.prototype_weight
         self.classification_weight = config.model.classification_weight
     
+    def to(self, device):
+        """Ensure proper device movement for all components"""
+        super().to(device)
+        self.encoder = self.encoder.to(device)
+        self.prototype_network = self.prototype_network.to(device)
+        self.topic_classifier = self.topic_classifier.to(device)
+        return self
+    
     def forward(
         self,
         sequence_output: torch.Tensor,
         attention_mask: torch.Tensor,
         texts: List[str],
         language_ids: torch.Tensor,
-        languages: List[str],
+        languages: List[str] = None,
         support_set: Optional[Dict] = None,
         labels: Optional[torch.Tensor] = None
     ) -> Dict:
-        """Forward pass for topic branch"""
+        """Forward pass with device consistency"""
+        device = sequence_output.device
+        
+        if languages is None:
+            languages = list(self.encoder.language_adapters.keys())
+            
+        # Move inputs to correct device
+        attention_mask = attention_mask.to(device)
+        language_ids = language_ids.to(device)
+        if labels is not None:
+            labels = labels.to(device)
+            
         # Encode topics
         topic_features = self.encoder(
             sequence_output,
@@ -182,10 +183,7 @@ class TopicBranch(nn.Module):
         }
         
         if support_set is not None:
-            # Few-shot mode
-            support_features = self.prototype_network(support_set['topic_features'])
-            
-            # Compute similarities to support set
+            support_features = self.prototype_network(support_set['topic_features'].to(device))
             similarities = self.prototype_network.compute_similarities(
                 prototype_features,
                 support_features
@@ -196,7 +194,6 @@ class TopicBranch(nn.Module):
                 prototype_loss = nn.CrossEntropyLoss()(similarities, labels)
                 outputs['prototype_loss'] = prototype_loss
         else:
-            # Regular classification mode
             logits = self.topic_classifier(prototype_features)
             outputs['logits'] = logits
             
@@ -204,7 +201,6 @@ class TopicBranch(nn.Module):
                 classification_loss = nn.CrossEntropyLoss()(logits, labels)
                 outputs['classification_loss'] = classification_loss
         
-        # Compute total loss if in training mode
         if labels is not None:
             total_loss = 0
             if 'prototype_loss' in outputs:
