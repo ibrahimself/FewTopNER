@@ -316,14 +316,12 @@ class SharedEncoder(nn.Module):
         # Add positional encoding
         hidden_states = self.positional_encoding(hidden_states)
         
-        # Apply language calibration
-        calibrated_states = self.language_calibration(
-            hidden_states,
-            language_ids,
-            attention_mask
-        )
+        # Apply language calibration; this returns a dict.
+        calibrated_output = self.language_calibration(hidden_states, language_ids, attention_mask)
+        # Extract the calibrated hidden states from the dict.
+        calibrated_states = calibrated_output["hidden_states"]
         
-        # Project features
+        # Project features (now 'calibrated_states' is a tensor)
         projected_states = self.projection(calibrated_states)
         normalized_states = self.layer_norm(projected_states)
         
