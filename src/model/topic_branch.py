@@ -122,13 +122,23 @@ class TopicPrototypeNetwork(nn.Module):
         super().__init__()
         self.config = config
         
-        # Create the prototype network layers
-        self.network = nn.Sequential(
+        # Topic encoder with device handling
+        self.encoder = TopicEncoder(config)
+        
+        # Create prototype network
+        self.prototype_network = nn.Sequential(
             nn.Linear(config.model.topic_hidden_size, config.model.prototype_dim),
             nn.LayerNorm(config.model.prototype_dim),
             nn.ReLU(),
             nn.Dropout(config.model.dropout)
         )
+        
+        # Topic classifier
+        self.topic_classifier = nn.Linear(config.model.prototype_dim, config.model.num_topics)
+        
+        # Loss weights
+        self.prototype_weight = config.model.prototype_weight
+        self.classification_weight = config.model.classification_weight
         
     def forward(self, x):
         """
