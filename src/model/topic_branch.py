@@ -16,6 +16,7 @@ class TopicEncoder(nn.Module):
         self.lda_models = {}
         self.dictionaries = {}
         
+        
         # Language adapters
         self.language_adapters = nn.ModuleDict({
             lang: nn.Sequential(
@@ -115,6 +116,66 @@ class TopicEncoder(nn.Module):
         topic_features = self.topic_fusion(combined_features)
         
         return topic_features
+    
+class TopicPrototypeNetwork(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        # Create the prototype network layers
+        self.network = nn.Sequential(
+            nn.Linear(config.model.topic_hidden_size, config.model.prototype_dim),
+            nn.LayerNorm(config.model.prototype_dim),
+            nn.ReLU(),
+            nn.Dropout(config.model.dropout)
+        )
+        
+    def forward(self, x):
+        """
+        Forward pass through the prototype network
+        Args:
+            x (torch.Tensor): Input features [batch_size, hidden_size]
+        Returns:
+            torch.Tensor: Prototype features [batch_size, prototype_dim]
+        """
+        return self.network(x)
+    
+    def compute_prototype_loss(self, support_features, support_labels):
+        """
+        Compute prototype loss based on support set
+        Args:
+            support_features (torch.Tensor): Features from support set
+            support_labels (torch.Tensor): Labels from support set
+        Returns:
+            torch.Tensor: Prototype loss
+        """
+        # Get unique labels
+        unique_labels = torch.unique(support_labels)
+        
+        # Compute prototypes for each class
+        prototypes = []
+        for label in unique_labels:
+            mask = (support_labels == label)
+            class_features = support_features[mask]
+            prototype = class_features.mean(dim=0)
+            prototypes.append(prototype)
+        prototypes = torch.stack(prototypes)
+        
+        # Compute distances to prototypes
+        distances = torch.cdist(
+            support_features, 
+            prototypes
+        )
+        
+        # Convert labels to indices
+        label_indices = torch.zeros_like(support_labels)
+        for i, label in enumerate(unique_labels):
+            label_indices[support_labels == label] = i
+            
+        # Compute loss
+        loss = nn.CrossEntropyLoss()(-distances, label_indices)
+        
+        return loss
 
 class TopicBranch(nn.Module):
     """Topic modeling branch with prototype learning"""
