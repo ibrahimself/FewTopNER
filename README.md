@@ -171,10 +171,10 @@ This project is licensed under the [Creative Commons Attribution-NonCommercial-S
 
 If you use **FewTopNER** in your research, please cite it as follows:
 ```bibtex
-@article{fewtopner2024,
-  title={FewTopNER: Few-shot Learning for Joint Named Entity Recognition and Topic Modeling},
-  author={Your Name},
-  journal={arXiv preprint arXiv:2024.xxxxx},
-  year={2024}
+@article{bouabdallaoui2025fewtopner,
+  title={FewTopNER: Integrating Few-Shot Learning with Topic Modeling and Named Entity Recognition in a Multilingual Framework},
+  author={Bouabdallaoui, Ibrahim and Guerouate, Fatima and Bouhaddour, Samya and Saadi, Chaimae and Sbihi, Mohammed},
+  journal={arXiv preprint arXiv:2502.02391},
+  year={2025}
 }
 ```
